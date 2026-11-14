@@ -29,26 +29,20 @@ subagent({ name: "Scout: DB", agent: "scout", task: "Map database schema" });
 pi install git:github.com/HazAT/pi-interactive-subagents
 ```
 
-Supported multiplexers:
+Backend: Herdr Core only. Run pi inside the Herdr app (`HC_TERMINAL_ID` set; `hc` and `herdr-app` on PATH). Each subagent is a Herdr terminal shown as a pane.
 
-- [cmux](https://github.com/manaflow-ai/cmux)
-- [tmux](https://github.com/tmux/tmux)
-- [zellij](https://zellij.dev)
-- [WezTerm](https://wezfurlong.org/wezterm/) (terminal emulator with built-in multiplexing)
+Layout (new children only):
 
-Start pi inside one of them:
+- `split` (default): children stack in one column to the right of the parent pane. After `maxSplitChildren` (default 4) live children, new ones go to the tab.
+- `tab`: children go into one shared tab named "Subagents" in the parent's space.
 
-```bash
-cmux pi
-# or
-tmux new -A -s pi 'pi'
-# or
-zellij --session pi   # then run: pi
-# or
-# just run pi inside WezTerm — no wrapper needed
+Herdr moves focus to a new split pane; the extension returns focus to the parent right after each split. Set defaults in `~/.pi/agent/settings.json` (or project `.pi/settings.json`):
+
+```json
+{ "hc-subagents": { "layout": "split", "maxSplitChildren": 4 } }
 ```
 
-Optional: set `PI_SUBAGENT_MUX=cmux|tmux|zellij|wezterm` to force a specific backend.
+Change the layout for the rest of the session with `/subagents layout split|tab` (no argument shows the current layout). Each child terminal gets `hc` labels: `pi.subagent`, `pi.role`, `pi.name`, `pi.parent`, `pi.task`.
 
 If your shell startup is slow and subagent commands sometimes get dropped before the prompt is ready, set `PI_SUBAGENT_SHELL_READY_DELAY_MS` to a higher value (defaults to `500`):
 
@@ -56,7 +50,7 @@ If your shell startup is slow and subagent commands sometimes get dropped before
 export PI_SUBAGENT_SHELL_READY_DELAY_MS=2500
 ```
 
-Subagent panes are created without stealing keyboard focus (cmux, tmux). Launch commands target child surfaces by explicit ID, so focus and command delivery are independent. Note: the `interactive` option controls parent status notifications, not terminal focus.
+Child panes start a clean bash and get the launch command by `hc send`. Note: the `interactive` option controls parent status notifications, not terminal focus.
 
 ## What's Included
 
@@ -451,6 +445,29 @@ spawning: false
 
 ---
 
+## Lean children
+
+By default a child Pi loads your full extension setup. Extensions such as tool-discovery can then hide `subagent_done`, so the child never finishes. Set `childExtensions` to start children with `-ne` plus a fixed allowlist:
+
+```json
+"hc-subagents": {
+  "layout": "split",
+  "maxSplitChildren": 4,
+  "childExtensions": [
+    "~/.pi/agent/npm/node_modules/pi-claude-bridge",
+    "~/.pi/agent/npm/node_modules/cc-safety-net",
+    "~/.pi/agent/extensions/commit-guard.ts"
+  ]
+}
+```
+
+- Each entry is an absolute or `~/` path to an extension file, or to a package directory (its `package.json` `pi.extensions` entries are used). Missing entries are skipped with a warning.
+- Command order: `-ne`, the allowlist, the agent's `extensions:` frontmatter (comma-separated or YAML list, same path rules), then `subagent-done.ts`.
+- This package's own extension is never loaded in a child (no nesting).
+- Unset: children inherit everything (old behavior). An empty array means `-ne` only.
+- Providers that come from extensions (for example `claude-bridge/*` models) exist in a lean child only if you list that extension.
+- On session shutdown, still-running children are closed (`hc kill` then `hc rm`).
+
 ## Tools Widget
 
 Every sub-agent session displays a compact tools widget showing available and denied tools. Toggle with `Ctrl+J`:
@@ -467,27 +484,7 @@ Every sub-agent session displays a compact tools widget showing available and de
 ## Requirements
 
 - [pi](https://github.com/badlogic/pi-mono) — the coding agent
-- One supported multiplexer:
-  - [cmux](https://github.com/manaflow-ai/cmux)
-  - [tmux](https://github.com/tmux/tmux)
-  - [zellij](https://zellij.dev)
-  - [WezTerm](https://wezfurlong.org/wezterm/)
-
-```bash
-cmux pi
-# or
-tmux new -A -s pi 'pi'
-# or
-zellij --session pi   # then run: pi
-# or
-# just run pi inside WezTerm
-```
-
-Optional backend override:
-
-```bash
-export PI_SUBAGENT_MUX=cmux   # or tmux, zellij, wezterm
-```
+- [Herdr](https://herdr.dev) app with Herdr Core (`hc`, `herdr-app`); run pi inside it
 
 ---
 

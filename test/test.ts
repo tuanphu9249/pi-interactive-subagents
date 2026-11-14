@@ -1,10 +1,10 @@
-import { describe, it, before, after } from "node:test";
+import { describe, it, before, after, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { visibleWidth } from "@mariozechner/pi-tui";
+import { visibleWidth } from "@earendil-works/pi-tui";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
 
 import {
@@ -19,18 +19,19 @@ import {
 
 import {
   shellEscape,
-  isCmuxAvailable,
-  isWezTermAvailable,
-  parseCmuxFocusedSnapshot,
-  parseCmuxFocusedSnapshotFromJson,
-  parseCmuxJson,
-  parseCmuxPaneRefForSurface,
-  parseCmuxPaneRefForSurfaceFromJson,
-  canSplitZellijPane,
-  predictZellijSplitDirection,
-  selectZellijPlacement,
-  selectZellijStackPlacement,
-} from "../pi-extension/subagents/cmux.ts";
+  __setHcExec,
+  __resetHcState,
+  createSurface,
+  sendEscape,
+  readScreen,
+  closeSurface,
+  sendCommand,
+  getMuxBackend,
+  setLayoutMode,
+  parseLayoutSettings,
+  __setHcSettings,
+} from "../pi-extension/subagents/hc.ts";
+import { resolveChildExtensions, parseExtensionsField } from "../pi-extension/subagents/child-extensions.ts";
 import {
   advanceStatusState,
   capStatusLines,
@@ -54,7 +55,7 @@ import {
   shouldAutoExitOnAgentEnd,
   findLatestAssistantError,
 } from "../pi-extension/subagents/subagent-done.ts";
-import { __pollForExitTest__ } from "../pi-extension/subagents/cmux.ts";
+import { __pollForExitTest__ } from "../pi-extension/subagents/hc.ts";
 
 // --- Helpers ---
 
@@ -1294,7 +1295,7 @@ describe("subagent-done.ts", () => {
   });
 });
 
-describe("cmux.ts interpretExitSidecar", () => {
+describe("hc.ts interpretExitSidecar", () => {
   const { interpretExitSidecar } = __pollForExitTest__;
 
   it("decodes ping payloads", () => {
@@ -1412,7 +1413,7 @@ describe("tool registration", () => {
 
     const autoExitSchema = resumeTool.parameters.properties.autoExit;
     assert.equal(autoExitSchema.type, "boolean");
-    assert.match(autoExitSchema.description, /Defaults to true/);
+    assert.match(autoExitSchema.description, /default true/);
   });
 });
 
@@ -2085,8 +2086,7 @@ describe("subagents widget rendering", () => {
   });
 });
 
-describe("cmux.ts", () => {
-  describe("shellEscape", () => {
+describe("hc.ts shellEscape", () => {
     it("wraps in single quotes", () => {
       assert.equal(shellEscape("hello"), "'hello'");
     });
@@ -2109,270 +2109,292 @@ describe("cmux.ts", () => {
     });
   });
 
-  describe("parseCmuxFocusedSnapshot", () => {
-    it("parses focused surface and pane refs", () => {
-      assert.deepEqual(
-        parseCmuxFocusedSnapshot({ focused: { surface_ref: "surface:3", pane_ref: "pane:2" } }),
-        { surfaceRef: "surface:3", paneRef: "pane:2" },
-      );
-    });
+describe("hc.ts Herdr backend", () => {
+  type Call = { file: string; args: string[] };
+  const savedEnv = { id: process.env.HC_TERMINAL_ID, path: process.env.PATH };
+  let calls: Call[];
+  let binDir: string;
+  let nextTerminal: number;
+  let extraTerminals: Array<{ terminal: string; pane: string; tab: string }>;
 
-    it("does not fall back to caller refs", () => {
-      assert.equal(
-        parseCmuxFocusedSnapshot({ caller: { surface_ref: "surface:1", pane_ref: "pane:1" } }),
-        null,
-      );
-    });
+  function topology() {
+    const tabs: Record<string, any[]> = { tabParent: [{ terminal: "t1", pane: "pParent", status: "idle" }] };
+    for (const t of extraTerminals) {
+      (tabs[t.tab] ??= []).push({ terminal: t.terminal, pane: t.pane, status: "idle" });
+    }
+    return {
+      spaces: [
+        {
+          id: "spA",
+          name: "A",
+          tabs: Object.entries(tabs).map(([id, terminals]) => ({ id, name: id, terminals })),
+        },
+      ],
+    };
+  }
 
-    it("returns null for malformed values", () => {
-      assert.equal(parseCmuxFocusedSnapshot(null), null);
-      assert.equal(parseCmuxFocusedSnapshot({ focused: {} }), null);
+  before(() => {
+    binDir = mkdtempSync(join(tmpdir(), "hc-bin-"));
+    for (const name of ["hc", "herdr-app"]) {
+      writeFileSync(join(binDir, name), "#!/bin/sh\n", { mode: 0o755 });
+    }
+  });
+  after(() => {
+    rmSync(binDir, { recursive: true, force: true });
+  });
+
+  beforeEach(() => {
+    calls = [];
+    nextTerminal = 10;
+    extraTerminals = [];
+    __resetHcState();
+    process.env.HC_TERMINAL_ID = "t1";
+    process.env.PATH = `${binDir}:${savedEnv.path}`;
+    __setHcExec({
+      async: async () => "",
+      sync(file, args) {
+        calls.push({ file, args });
+        if (file === "herdr-app" && args[0] === "ls") return JSON.stringify(topology());
+        if (file === "herdr-app" && args[1] === "pane.split") {
+          const n = nextTerminal++;
+          extraTerminals.push({ terminal: `t${n}`, pane: `p${n}`, tab: "tabParent" });
+          return JSON.stringify({ pane: `p${n}`, terminal: `t${n}` });
+        }
+        if (file === "hc" && args[0] === "run") {
+          const n = nextTerminal++;
+          const tabLabel = args.find((a) => a.startsWith("herdr.tab="));
+          const tab = tabLabel ? tabLabel.slice("herdr.tab=".length) : "tabNew";
+          // Real ids are base-36 after `t` (e.g. `t1z`); `hc run --json` prints {address, ...}.
+          const id = `t${n}z`;
+          extraTerminals.push({ terminal: id, pane: `p${n}`, tab });
+          return JSON.stringify({ address: id, state: "running" }) + "\n";
+        }
+        return "";
+      },
     });
   });
 
-  describe("parseCmuxJson", () => {
-    it("returns null for malformed JSON text", () => {
-      assert.equal(parseCmuxJson("not json"), null);
-    });
-
-    it("parses valid JSON text", () => {
-      assert.deepEqual(parseCmuxJson('{"ok":true}'), { ok: true });
-    });
+  afterEach(() => {
+    __setHcExec(null);
+    if (savedEnv.id === undefined) delete process.env.HC_TERMINAL_ID;
+    else process.env.HC_TERMINAL_ID = savedEnv.id;
+    process.env.PATH = savedEnv.path;
   });
 
-  describe("parseCmuxFocusedSnapshotFromJson", () => {
-    it("returns null for malformed JSON text", () => {
-      assert.equal(parseCmuxFocusedSnapshotFromJson("not json"), null);
-    });
+  const doCalls = () => calls.filter((c) => c.file === "herdr-app" && c.args[0] === "do");
 
-    it("returns null when focused is absent or not an object", () => {
-      assert.equal(
-        parseCmuxFocusedSnapshotFromJson('{"focused":null,"caller":{"surface_ref":"surface:1","pane_ref":"pane:1"}}'),
-        null,
-      );
-      assert.equal(
-        parseCmuxFocusedSnapshotFromJson('{"caller":{"surface_ref":"surface:1","pane_ref":"pane:1"}}'),
-        null,
-      );
-    });
-
-    it("parses focused refs without falling back to caller refs", () => {
-      assert.deepEqual(
-        parseCmuxFocusedSnapshotFromJson(
-          '{"caller":{"surface_ref":"surface:1","pane_ref":"pane:1"},"focused":{"surface_ref":"surface:2","pane_ref":"pane:3"}}',
-        ),
-        { surfaceRef: "surface:2", paneRef: "pane:3" },
-      );
-    });
+  it("detects the backend from HC_TERMINAL_ID and PATH", () => {
+    assert.equal(getMuxBackend(), "herdr");
+    delete process.env.HC_TERMINAL_ID;
+    assert.equal(getMuxBackend(), null);
+    process.env.HC_TERMINAL_ID = "t1";
+    process.env.PATH = "/nonexistent";
+    assert.equal(getMuxBackend(), null);
   });
 
-  describe("parseCmuxPaneRefForSurface", () => {
-    it("parses top-level pane refs for a surface", () => {
-      assert.equal(
-        parseCmuxPaneRefForSurface({ surface_ref: "surface:7", pane_ref: "pane:4" }, "surface:7"),
-        "pane:4",
-      );
-    });
+  it("splits right, then down on the last child, and refocuses the parent right after each split", () => {
+    const a = createSurface("a");
+    const b = createSurface("b");
+    assert.deepEqual([a, b], ["t10", "t11"]);
 
-    it("parses caller pane refs for identify --surface output", () => {
-      assert.equal(
-        parseCmuxPaneRefForSurface(
-          { caller: { surface_ref: "surface:7", pane_ref: "pane:4" } },
-          "surface:7",
-        ),
-        "pane:4",
-      );
-    });
+    const seq = doCalls().map((c) => c.args.slice(1));
+    assert.deepEqual(seq[0], ["pane.split", "--direction", "right", "--pane", "pParent", "--argv", JSON.stringify(["/bin/bash", "--noprofile", "--norc"])]);
+    assert.deepEqual(seq[1], ["pane.focus", "--pane", "pParent"]);
+    assert.deepEqual(seq[2].slice(0, 5), ["pane.split", "--direction", "down", "--pane", "p10"]);
+    assert.deepEqual(seq[3], ["pane.focus", "--pane", "pParent"]);
 
-    it("returns null when the surface does not match", () => {
-      assert.equal(
-        parseCmuxPaneRefForSurface({ surface_ref: "surface:8", pane_ref: "pane:4" }, "surface:7"),
-        null,
-      );
-    });
+    // focus call is the very next CLI call after each split
+    const idx = calls.findIndex((c) => c.args[1] === "pane.split");
+    assert.equal(calls[idx + 1].args[1], "pane.focus");
   });
 
-  describe("parseCmuxPaneRefForSurfaceFromJson", () => {
-    it("returns null for malformed JSON text", () => {
-      assert.equal(parseCmuxPaneRefForSurfaceFromJson("not json", "surface:7"), null);
-    });
-
-    it("parses caller refs from cmux identify --surface JSON text", () => {
-      assert.equal(
-        parseCmuxPaneRefForSurfaceFromJson(
-          '{"caller":{"surface_ref":"surface:7","pane_ref":"pane:4"}}',
-          "surface:7",
-        ),
-        "pane:4",
-      );
-    });
+  it("overflows to the Subagents tab after maxSplitChildren live children", () => {
+    for (let i = 0; i < 4; i++) createSurface(`c${i}`);
+    assert.equal(doCalls().filter((c) => c.args[1] === "pane.split").length, 4);
+    const fifth = createSurface("c4");
+    const run = calls.find((c) => c.file === "hc" && c.args[0] === "run")!;
+    assert.ok(run.args.includes("herdr.space=spA"));
+    assert.ok(!run.args.some((a) => a.startsWith("herdr.tab=")));
+    assert.ok(fifth.startsWith("t"));
   });
 
-  describe("zellij placement", () => {
-    const pane = (overrides: any) => ({
-      id: 1,
-      is_plugin: false,
-      is_floating: false,
-      is_selectable: true,
-      exited: false,
-      pane_rows: 20,
-      pane_columns: 80,
-      tab_id: 1,
-      ...overrides,
-    });
+  it("tab mode: first child creates and renames the Subagents tab, later children reuse it", () => {
+    setLayoutMode("tab");
+    createSurface("a");
+    const rename = doCalls().find((c) => c.args[1] === "tab.rename")!;
+    assert.deepEqual(rename.args.slice(1), ["tab.rename", "--id", "tabNew", "--name", "Subagents"]);
+    assert.equal(doCalls().some((c) => c.args[1] === "pane.split"), false);
 
-    it("matches Zellij direction and minimum split rules", () => {
-      assert.equal(predictZellijSplitDirection(pane({ pane_rows: 5, pane_columns: 11 })), "right");
-      assert.equal(predictZellijSplitDirection(pane({ pane_rows: 11, pane_columns: 5 })), "down");
-      assert.equal(predictZellijSplitDirection(pane({ pane_rows: 5, pane_columns: 10 })), null);
-      assert.equal(predictZellijSplitDirection(pane({ pane_rows: 4, pane_columns: 80 })), null);
-
-      assert.equal(canSplitZellijPane(pane({ pane_rows: 5, pane_columns: 11 })), true);
-      assert.equal(canSplitZellijPane(pane({ pane_rows: 11, pane_columns: 5 })), true);
-      assert.equal(canSplitZellijPane(pane({ pane_rows: 5, pane_columns: 10 })), false);
-      assert.equal(canSplitZellijPane(pane({ pane_rows: 4, pane_columns: 80 })), false);
-
-      assert.equal(canSplitZellijPane(pane({ pane_rows: 30, pane_columns: 100 }), 80, 20), false);
-      assert.equal(canSplitZellijPane(pane({ pane_rows: 45, pane_columns: 100 }), 80, 20), true);
-      assert.equal(canSplitZellijPane(pane({ pane_rows: 30, pane_columns: 170 }), 80, 20), true);
-      assert.equal(canSplitZellijPane(pane({ pane_rows: 31, pane_columns: 47 }), 50, 10), false);
-      assert.equal(canSplitZellijPane(pane({ pane_rows: 31, pane_columns: 77 }), 50, 10), true);
-    });
-
-    it("uses tab-scoped split only when all Zellij split candidates are safe", () => {
-      const plan = selectZellijPlacement(
-        [
-          pane({ id: 10, tab_id: 1, pane_rows: 40, pane_columns: 120 }),
-          pane({ id: 11, tab_id: 1, pane_rows: 120, pane_columns: 100 }),
-          pane({ id: 12, tab_id: 2, pane_rows: 60, pane_columns: 200 }),
-        ],
-        10,
-      );
-
-      assert.deepEqual(plan, {
-        mode: "split",
-        anchorPaneId: 11,
-        targetPaneId: 11,
-        tabId: 1,
-        splitDirection: "down",
-      });
-    });
-
-    it("stacks when any Zellij split candidate would fall below Pi's configured minimum", () => {
-      const plan = selectZellijPlacement(
-        [
-          pane({ id: 10, tab_id: 1, pane_rows: 100, pane_columns: 47 }),
-          pane({ id: 11, tab_id: 1, pane_rows: 31, pane_columns: 77 }),
-        ],
-        10,
-        50,
-        10,
-      );
-
-      assert.deepEqual(plan, {
-        mode: "stack",
-        anchorPaneId: 11,
-        targetPaneId: 11,
-        tabId: 1,
-      });
-    });
-
-    it("stacks when Zellij would split a pane below Pi's usable minimum", () => {
-      const plan = selectZellijPlacement(
-        [
-          pane({ id: 10, tab_id: 1, pane_rows: 20, pane_columns: 20 }),
-          pane({ id: 11, tab_id: 1, pane_rows: 18, pane_columns: 60 }),
-          pane({ id: 12, tab_id: 1, pane_rows: 10, pane_columns: 70 }),
-        ],
-        10,
-      );
-
-      assert.deepEqual(plan, {
-        mode: "stack",
-        anchorPaneId: 11,
-        targetPaneId: 11,
-        tabId: 1,
-      });
-    });
-
-    it("never chooses the parent pane as the stack target", () => {
-      const plan = selectZellijStackPlacement(
-        [
-          pane({ id: 10, tab_id: 1, pane_rows: 60, pane_columns: 200 }),
-          pane({ id: 11, tab_id: 1, pane_rows: 10, pane_columns: 20 }),
-          pane({ id: 12, tab_id: 1, pane_rows: 8, pane_columns: 30 }),
-        ],
-        10,
-      );
-
-      assert.deepEqual(plan, {
-        mode: "stack",
-        anchorPaneId: 12,
-        targetPaneId: 12,
-        tabId: 1,
-      });
-    });
-
-    it("does not stack when the only usable pane is the parent", () => {
-      const plan = selectZellijStackPlacement(
-        [pane({ id: 10, tab_id: 1, pane_rows: 60, pane_columns: 200 })],
-        10,
-      );
-
-      assert.equal(plan, null);
-    });
-
-    it("stacks on the largest usable non-parent pane when none can split", () => {
-      const plan = selectZellijPlacement(
-        [
-          pane({ id: 10, tab_id: 1, pane_rows: 5, pane_columns: 10 }),
-          pane({ id: 11, tab_id: 1, pane_rows: 6, pane_columns: 8 }),
-          pane({ id: 12, tab_id: 2, pane_rows: 60, pane_columns: 200 }),
-        ],
-        10,
-      );
-
-      assert.deepEqual(plan, {
-        mode: "stack",
-        anchorPaneId: 11,
-        targetPaneId: 11,
-        tabId: 1,
-      });
-    });
-
-    it("ignores floating, plugin, exited, unselectable, and other-tab panes", () => {
-      const plan = selectZellijPlacement(
-        [
-          pane({ id: 10, tab_id: 1, pane_rows: 5, pane_columns: 10 }),
-          pane({ id: 11, tab_id: 1, pane_rows: 60, pane_columns: 200, is_floating: true }),
-          pane({ id: 12, tab_id: 1, pane_rows: 60, pane_columns: 200, is_plugin: true }),
-          pane({ id: 13, tab_id: 1, pane_rows: 60, pane_columns: 200, exited: true }),
-          pane({ id: 14, tab_id: 1, pane_rows: 60, pane_columns: 200, is_selectable: false }),
-          pane({ id: 15, tab_id: 2, pane_rows: 60, pane_columns: 200 }),
-        ],
-        10,
-      );
-
-      assert.equal(plan, null);
-    });
-
-    it("returns null when the parent pane cannot be found", () => {
-      assert.equal(selectZellijPlacement([pane({ id: 10 })], 99), null);
-    });
+    createSurface("b");
+    const runs = calls.filter((c) => c.file === "hc" && c.args[0] === "run");
+    assert.equal(runs.length, 2);
+    assert.ok(runs[1].args.includes("herdr.tab=tabNew"));
+    assert.equal(doCalls().filter((c) => c.args[1] === "tab.rename").length, 1);
   });
 
-  describe("isCmuxAvailable", () => {
-    it("returns boolean based on CMUX_SOCKET_PATH", () => {
-      // Can't easily mock env in node:test, just verify it returns a boolean
-      const result = isCmuxAvailable();
-      assert.equal(typeof result, "boolean");
-    });
+  it("sets labels on each child", () => {
+    const t = createSurface("My Agent", { role: "worker", task: "line one\nline two " + "x".repeat(200) });
+    const label = calls.find((c) => c.file === "hc" && c.args[0] === "label")!;
+    assert.equal(label.args[1], t);
+    assert.ok(label.args.includes("pi.subagent=1"));
+    assert.ok(label.args.includes("pi.role=worker"));
+    assert.ok(label.args.includes("pi.name=My Agent"));
+    assert.ok(label.args.includes("pi.parent=t1"));
+    const task = label.args.find((a) => a.startsWith("pi.task="))!;
+    assert.equal(task.length, "pi.task=".length + 120);
+    assert.ok(!task.includes("\n"));
+    createSurface("other");
+    const second = calls.filter((c) => c.file === "hc" && c.args[0] === "label")[1];
+    assert.ok(second.args.includes("pi.role=none"));
   });
 
-  describe("isWezTermAvailable", () => {
-    it("returns boolean based on WEZTERM_UNIX_SOCKET", () => {
-      const result = isWezTermAvailable();
-      assert.equal(typeof result, "boolean");
+  it("maps interrupt, read, send and close to hc commands", () => {
+    const t = createSurface("a");
+    calls.length = 0;
+    sendEscape(t);
+    readScreen(t, 30);
+    sendCommand(t, "echo hi");
+    closeSurface(t);
+    assert.deepEqual(calls.map((c) => [c.file, ...c.args]), [
+      ["hc", "keys", t, "esc"],
+      ["hc", "read", t, "--lines", "30"],
+      ["hc", "send", t, "echo hi"],
+      ["hc", "kill", t],
+      ["hc", "rm", t],
+    ]);
+  });
+
+  it("closing a split child frees its slot in the column", () => {
+    const ids = [0, 1, 2, 3].map((i) => createSurface(`c${i}`));
+    closeSurface(ids[3]);
+    calls.length = 0;
+    createSurface("again");
+    assert.ok(doCalls().some((c) => c.args[1] === "pane.split" && c.args.includes("p12")));
+  });
+
+  it("parses layout settings", () => {
+    assert.deepEqual(parseLayoutSettings({ layout: "tab", maxSplitChildren: 2 }), { layout: "tab", maxSplitChildren: 2 });
+    assert.deepEqual(parseLayoutSettings({ layout: "bogus", maxSplitChildren: -1 }), {});
+    assert.deepEqual(parseLayoutSettings(undefined), {});
+  });
+});
+
+
+describe("lean child extensions", () => {
+  const { buildChildExtensionArgs, runningSubagents, loadAgentDefaults } = (subagentsModule as any).__test__;
+  const selfIndex = fileURLToPath(new URL("../pi-extension/subagents/index.ts", import.meta.url));
+  const doneTs = fileURLToPath(new URL("../pi-extension/subagents/subagent-done.ts", import.meta.url));
+  let dir: string;
+  let calls: { file: string; args: string[] }[];
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "lean-"));
+    calls = [];
+    __resetHcState();
+    __setHcExec({
+      sync: (file, args) => {
+        calls.push({ file, args });
+        return "";
+      },
+      async: async () => "",
     });
+  });
+  afterEach(() => {
+    __setHcExec(null);
+    __resetHcState();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  const q = (p: string) => `'${p}'`;
+
+  it("inherit mode: only subagent-done", () => {
+    __setHcSettings({});
+    assert.deepEqual(buildChildExtensionArgs(["/x/ignored.ts"]), ["-e", q(doneTs)]);
+  });
+
+  it("lean mode order: -ne, allowlist, frontmatter extras, subagent-done", () => {
+    const a = join(dir, "a.ts");
+    const b = join(dir, "b.ts");
+    writeFileSync(a, "");
+    writeFileSync(b, "");
+    __setHcSettings({ childExtensions: [a] });
+    assert.deepEqual(buildChildExtensionArgs([b]), ["-ne", "-e", q(a), "-e", q(b), "-e", q(doneTs)]);
+  });
+
+  it("empty array still means lean", () => {
+    __setHcSettings({ childExtensions: [] });
+    assert.deepEqual(buildChildExtensionArgs(), ["-ne", "-e", q(doneTs)]);
+  });
+
+  it("expands package dirs via pi.extensions", () => {
+    const pkg = join(dir, "pkg");
+    mkdirSync(join(pkg, "src"), { recursive: true });
+    writeFileSync(join(pkg, "src", "x.ts"), "");
+    writeFileSync(join(pkg, "package.json"), JSON.stringify({ pi: { extensions: ["./src/x.ts", "./gone.ts"] } }));
+    const warns: string[] = [];
+    const out = resolveChildExtensions([pkg], { selfPath: selfIndex, warn: (m) => warns.push(m) });
+    assert.deepEqual(out, [join(pkg, "src", "x.ts")]);
+    assert.equal(warns.length, 1);
+  });
+
+  it("skips and warns on missing paths", () => {
+    const warns: string[] = [];
+    const out = resolveChildExtensions([join(dir, "nope.ts")], { selfPath: selfIndex, warn: (m) => warns.push(m) });
+    assert.deepEqual(out, []);
+    assert.equal(warns.length, 1);
+  });
+
+  it("never loads the fork's own index.ts (direct or via package dir)", () => {
+    const pkg = join(dir, "self");
+    mkdirSync(pkg);
+    writeFileSync(join(pkg, "package.json"), JSON.stringify({ pi: { extensions: [selfIndex] } }));
+    const out = resolveChildExtensions([selfIndex, pkg], { selfPath: selfIndex, warn: () => {} });
+    assert.deepEqual(out, []);
+  });
+
+  it("parses frontmatter extensions as list forms", () => {
+    assert.deepEqual(parseExtensionsField("name: x\nextensions: ~/a.ts, /b.ts"), ["~/a.ts", "/b.ts"]);
+    assert.deepEqual(parseExtensionsField("extensions: [\"/a.ts\", /b.ts]"), ["/a.ts", "/b.ts"]);
+    assert.deepEqual(parseExtensionsField("extensions:\n  - /a.ts\n  - /b.ts\nmodel: m"), ["/a.ts", "/b.ts"]);
+    assert.equal(parseExtensionsField("name: x"), undefined);
+  });
+
+  it("closeSurface runs kill then rm and ignores rm errors", () => {
+    __setHcExec({
+      sync: (file, args) => {
+        calls.push({ file, args });
+        if (args[0] === "rm") throw new Error("no such terminal");
+        return "";
+      },
+      async: async () => "",
+    });
+    closeSurface("t9");
+    assert.deepEqual(calls.map((c) => c.args), [["kill", "t9"], ["rm", "t9"]]);
+  });
+
+  it("session_shutdown closes running children", () => {
+    const handlers: Record<string, Function> = {};
+    const fakePi: any = { on: (n: string, h: Function) => (handlers[n] = h), registerTool() {}, registerCommand() {}, registerMessageRenderer() {}, registerShortcut() {} };
+    try {
+      (subagentsModule as any).default(fakePi);
+    } catch {}
+    assert.ok(handlers.session_shutdown);
+    runningSubagents.set("zz", { id: "zz", surface: "t77", name: "n" } as any);
+    handlers.session_shutdown({ reason: "quit" }, {});
+    assert.ok(calls.some((c) => c.args[0] === "kill" && c.args[1] === "t77"));
+    assert.ok(calls.some((c) => c.args[0] === "rm" && c.args[1] === "t77"));
+    assert.equal(runningSubagents.size, 0);
+  });
+
+  it("session_shutdown keeps children running on reload", () => {
+    const handlers: Record<string, Function> = {};
+    const fakePi: any = { on: (n: string, h: Function) => (handlers[n] = h), registerTool() {}, registerCommand() {}, registerMessageRenderer() {}, registerShortcut() {} };
+    try {
+      (subagentsModule as any).default(fakePi);
+    } catch {}
+    runningSubagents.set("zy", { id: "zy", surface: "t78", name: "n" } as any);
+    handlers.session_shutdown({ reason: "reload" }, {});
+    assert.ok(!calls.some((c) => c.args[0] === "kill" && c.args[1] === "t78"));
+    assert.equal(runningSubagents.size, 0);
   });
 });

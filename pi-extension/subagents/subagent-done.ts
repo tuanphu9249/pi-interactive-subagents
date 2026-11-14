@@ -3,8 +3,8 @@
  * - Shows agent identity + available tools as a styled widget above the editor (toggle with Ctrl+J)
  * - Provides a `subagent_done` tool for autonomous agents to self-terminate
  */
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { Box, Text } from "@mariozechner/pi-tui";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { writeFileSync } from "node:fs";
 import { createSubagentActivityRecorder } from "./activity.ts";
@@ -269,11 +269,9 @@ export default function (pi: ExtensionAPI) {
     name: "caller_ping",
     label: "Caller Ping",
     description:
-      "Send a help request to the parent agent and exit this session. " +
-      "The parent will be notified with your message and can resume this session with a response. " +
-      "Use when you're stuck, need clarification, or need the parent to take action.",
+      "Ask the parent for help and exit this session; the parent can resume it with a reply.",
     parameters: Type.Object({
-      message: Type.String({ description: "What you need help with" }),
+      message: Type.String({ description: "Your question" }),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const sessionFile = process.env.PI_SUBAGENT_SESSION;
@@ -304,9 +302,7 @@ export default function (pi: ExtensionAPI) {
     name: "subagent_done",
     label: "Subagent Done",
     description:
-      "Call this tool when you have completed your task. " +
-      "It will close this session and return your results to the main session. " +
-      "Your LAST assistant message before calling this becomes the summary returned to the caller.",
+      "Finish: close this session and return your last assistant message to the caller as the summary.",
     parameters: Type.Object({}),
     async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
       const sessionFile = process.env.PI_SUBAGENT_SESSION;

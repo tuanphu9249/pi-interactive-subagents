@@ -1,7 +1,7 @@
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { keyHint } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { keyHint } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "@sinclair/typebox";
-import { Box, Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
+import { Box, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -14,6 +14,7 @@ import {
   unlinkSync,
 } from "node:fs";
 import { homedir } from "node:os";
+import { parseExtensionsField, resolveChildExtensions } from "./child-extensions.ts";
 import {
   isMuxAvailable,
   muxSetupHint,
@@ -27,7 +28,11 @@ import {
   renameCurrentTab,
   renameWorkspace,
   readScreen,
-} from "./cmux.ts";
+  getLayoutMode,
+  setLayoutMode,
+  getMaxSplitChildren,
+  getChildExtensionSettings,
+} from "./hc.ts";
 
 import {
   findLastAssistantMessage,
@@ -85,46 +90,46 @@ function getModuleAbortSignal(): AbortSignal {
 }
 
 const SubagentParams = Type.Object({
-  name: Type.String({ description: "Display name for the subagent" }),
-  task: Type.String({ description: "Task/prompt for the sub-agent" }),
+  name: Type.String({ description: "Name shown to the user" }),
+  task: Type.String({ description: "Task prompt" }),
   agent: Type.Optional(
     Type.String({
       description:
-        "Agent name to load defaults from (e.g. 'worker', 'scout', 'reviewer'). Reads ~/.pi/agent/agents/<name>.md for model, tools, skills.",
+        "Agent name whose defaults (model, tools, skills) to load",
     }),
   ),
   systemPrompt: Type.Optional(
-    Type.String({ description: "Appended to system prompt (role instructions)" }),
+    Type.String({ description: "Extra role instructions" }),
   ),
-  model: Type.Optional(Type.String({ description: "Model override (overrides agent default)" })),
+  model: Type.Optional(Type.String({ description: "Model override" })),
   skills: Type.Optional(
-    Type.String({ description: "Comma-separated skills (overrides agent default)" }),
+    Type.String({ description: "Comma-separated skills override" }),
   ),
   tools: Type.Optional(
-    Type.String({ description: "Comma-separated tools (overrides agent default)" }),
+    Type.String({ description: "Comma-separated tools override" }),
   ),
   cwd: Type.Optional(
     Type.String({
       description:
-        "Working directory for the sub-agent. The agent starts in this folder and picks up its local .pi/ config, CLAUDE.md, skills, and extensions. Use for role-specific subfolders.",
+        "Working directory for the sub-agent",
     }),
   ),
   fork: Type.Optional(
     Type.Boolean({
       description:
-        "Force the full-context fork mode for this spawn. The sub-agent inherits the current session conversation, overriding any agent frontmatter session-mode.",
+        "Fork: child inherits this conversation",
     }),
   ),
   interactive: Type.Optional(
     Type.Boolean({
       description:
-        "Mark the subagent as interactive (long-running, user drives the conversation in its own pane). When true, the main session is not woken by status transitions (stalled/recovered) for this subagent. If omitted, falls back to the agent's `interactive` frontmatter, otherwise the inverse of `auto-exit` (agents that auto-exit are autonomous and get stall pings; agents that don't are interactive and stay quiet).",
+        "Interactive: user drives it; no stall pings",
     }),
   ),
   resumeSessionId: Type.Optional(
     Type.String({
       description:
-        "Resume a previous Claude Code session by its ID. Loads the conversation history and continues where it left off. The session ID is returned in details of every claude tool call. Use this to retry cancelled runs or ask follow-up questions.",
+        "Claude Code session ID to resume",
     }),
   ),
 });
@@ -144,6 +149,7 @@ interface AgentDefaults {
   sessionMode?: SubagentSessionMode;
   cwd?: string;
   cli?: string;
+  extensions?: string[];
   body?: string;
   disableModelInvocation?: boolean;
 }
@@ -248,6 +254,7 @@ function parseAgentDefinition(content: string, fallbackName: string): AgentDefin
     sessionMode: parseSessionMode(getFrontmatterValue(frontmatter, "session-mode")),
     cwd: getFrontmatterValue(frontmatter, "cwd"),
     cli: getFrontmatterValue(frontmatter, "cli"),
+    extensions: parseExtensionsField(frontmatter),
     body: body || undefined,
     disableModelInvocation:
       getFrontmatterValue(frontmatter, "disable-model-invocation")?.toLowerCase() === "true",
@@ -897,6 +904,7 @@ export const __test__ = {
   getShellReadyDelayMs,
   renderSubagentWidgetLines,
   loadAgentDefaults,
+  buildChildExtensionArgs,
   discoverAgentDefinitions,
   resolveEffectiveSessionMode,
   resolveLaunchBehavior,
@@ -969,7 +977,7 @@ async function launchSubagent(
   // Use pre-created surface (parallel mode) or create a new one.
   // For new surfaces, pause briefly so the shell is ready before sending the command.
   const surfacePreCreated = !!options?.surface;
-  const surface = options?.surface ?? createSurface(params.name);
+  const surface = options?.surface ?? createSurface(params.name, { role: params.agent, task: params.task });
   if (!surfacePreCreated) {
     await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
   }
@@ -1085,8 +1093,7 @@ async function launchSubagent(
   const parts: string[] = ["pi"];
   parts.push("--session", shellEscape(subagentSessionFile));
 
-  const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
-  parts.push("-e", shellEscape(subagentDonePath));
+  parts.push(...buildChildExtensionArgs(agentDefs?.extensions));
 
   if (effectiveModel) {
     const model = effectiveThinking ? `${effectiveModel}:${effectiveThinking}` : effectiveModel;
@@ -1357,6 +1364,34 @@ async function watchSubagent(
   }
 }
 
+const warnedChildExt = new Set<string>();
+function warnOnce(msg: string) {
+  if (warnedChildExt.has(msg)) return;
+  warnedChildExt.add(msg);
+  if (latestCtx?.hasUI) latestCtx.ui.notify(msg, "warning");
+  else console.error(msg);
+}
+
+/**
+ * Extension flags for a Pi child. With `childExtensions` set: `-ne`, the
+ * allowlist, agent frontmatter extras, then subagent-done.ts. Otherwise only
+ * subagent-done.ts (child inherits the full setup).
+ */
+function buildChildExtensionArgs(agentExtensions?: string[]): string[] {
+  const args: string[] = [];
+  const configured = getChildExtensionSettings();
+  if (configured) {
+    const resolved = resolveChildExtensions([...configured, ...(agentExtensions ?? [])], {
+      selfPath: join(SUBAGENTS_DIR, "index.ts"),
+      warn: warnOnce,
+    });
+    args.push("-ne");
+    for (const p of resolved) args.push("-e", shellEscape(p));
+  }
+  args.push("-e", shellEscape(join(SUBAGENTS_DIR, "subagent-done.ts")));
+  return args;
+}
+
 export default function subagentsExtension(pi: ExtensionAPI) {
   // Capture the UI context for widget updates
   pi.on("session_start", (_event, ctx) => {
@@ -1364,7 +1399,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   });
 
   // Clean up on session shutdown
-  pi.on("session_shutdown", (_event, _ctx) => {
+  pi.on("session_shutdown", (event, _ctx) => {
     if (widgetInterval) {
       clearInterval(widgetInterval);
       widgetInterval = null;
@@ -1377,8 +1412,15 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     }
     const moduleAbort = (globalThis as any)[POLL_ABORT_KEY] as AbortController | undefined;
     if (moduleAbort) moduleAbort.abort();
+    const quitting = (event as { reason?: string } | undefined)?.reason === "quit";
     for (const [_id, agent] of runningSubagents) {
       agent.abortController?.abort();
+      // pane.split children have die_with_parent:false; close them on quit.
+      // On reload/new/resume/fork they keep running in their pane (untracked).
+      if (!quitting) continue;
+      try {
+        closeSurface(agent.surface);
+      } catch {}
     }
     runningSubagents.clear();
   });
@@ -1399,19 +1441,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       name: "subagent",
       label: "Subagent",
       description:
-        "Spawn a sub-agent in a dedicated terminal multiplexer pane. " +
-        "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
-        "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
-        "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work — the harness handles delivery for you. " +
-        "DO NOT fabricate, assume, or summarize results after calling this tool. " +
-        "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready.",
-      promptSnippet:
-        "Spawn a sub-agent in a dedicated terminal multiplexer pane. " +
-        "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
-        "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
-        "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work — the harness handles delivery for you. " +
-        "DO NOT fabricate, assume, or summarize results after calling this tool. " +
-        "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready.",
+        "Spawn a Pi sub-session in its own Herdr pane. Runs async: returns at once, and the result is delivered back automatically when the child calls subagent_done. Do not poll or fabricate results. Set `agent` to load a named agent's defaults; omit it for a plain task. `name` is shown to the user.",
       parameters: SubagentParams,
 
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -1602,14 +1632,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     pi.registerTool({
       name: "subagent_interrupt",
       label: "Interrupt Subagent",
-      description:
-        "Send Escape to the active turn of a currently running Pi-backed subagent. " +
-        "The child pane, session, watcher, and running entry remain alive; this returns only a local acknowledgement " +
-        "and does not emit a subagent_result solely because of this request.",
-      promptSnippet:
-        "Send Escape to the active turn of a currently running Pi-backed subagent. " +
-        "The child pane, session, watcher, and running entry remain alive; this returns only a local acknowledgement " +
-        "and does not emit a subagent_result solely because of this request.",
+      description: "Send Escape to the active turn of a running Pi-backed subagent; its pane and session stay alive.",
       parameters: Type.Object({
         id: Type.Optional(Type.String({ description: "Exact running subagent id" })),
         name: Type.Optional(Type.String({ description: "Exact running subagent display name" })),
@@ -1654,14 +1677,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     pi.registerTool({
       name: "subagents_list",
       label: "List Subagents",
-      description:
-        "List all available subagent definitions. " +
-        "Scans project-local .pi/agents/ and global ~/.pi/agent/agents/. " +
-        "Project-local agents override global ones with the same name.",
-      promptSnippet:
-        "List all available subagent definitions. " +
-        "Scans project-local .pi/agents/ and global ~/.pi/agent/agents/. " +
-        "Project-local agents override global ones with the same name.",
+      description: "List available subagent definitions (project .pi/agents/ overrides global).",
       parameters: Type.Object({}),
 
       async execute() {
@@ -1711,33 +1727,21 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       name: "subagent_resume",
       label: "Resume Subagent",
       description:
-        "Resume a previous sub-agent session in a new multiplexer pane. " +
-        "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
-        "When the resumed sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
-        "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT poll for status. All of that is wasted work — the harness handles delivery for you. " +
-        "DO NOT fabricate or assume results. After resuming, either end your turn or work on other independent tasks; the harness will wake you when the result is ready. " +
-        "Use when a sub-agent was cancelled or needs follow-up work.",
-      promptSnippet:
-        "Resume a previous sub-agent session in a new multiplexer pane. " +
-        "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
-        "When the resumed sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
-        "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT poll for status. All of that is wasted work — the harness handles delivery for you. " +
-        "DO NOT fabricate or assume results. After resuming, either end your turn or work on other independent tasks; the harness will wake you when the result is ready. " +
-        "Use when a sub-agent was cancelled or needs follow-up work.",
+        "Resume a previous sub-agent session in a new pane. Async: the result is delivered back automatically; do not poll.",
       parameters: Type.Object({
-        sessionPath: Type.String({ description: "Path to the session .jsonl file to resume" }),
+        sessionPath: Type.String({ description: "Session .jsonl path" }),
         name: Type.Optional(
-          Type.String({ description: "Display name for the terminal tab. Default: 'Resume'" }),
+          Type.String({ description: "Tab name (default Resume)" }),
         ),
         message: Type.Optional(
           Type.String({
-            description: "Optional message to send after resuming (e.g. follow-up instructions)",
+            description: "Message to send after resuming",
           }),
         ),
         autoExit: Type.Optional(
           Type.Boolean({
             description:
-              "Whether the resumed session should automatically exit after completing its response. Defaults to true for autonomous follow-up work; set false for interactive resumed sessions.",
+              "Exit after responding (default true)",
           }),
         ),
       }),
@@ -1793,15 +1797,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Record entry count before resuming so we can extract new messages
         const entryCountBefore = getNewEntries(params.sessionPath, 0).length;
 
-        const surface = createSurface(name);
+        const surface = createSurface(name, { task: params.message });
         await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
 
         // Build pi resume command
         const parts = ["pi", "--session", shellEscape(params.sessionPath)];
 
         // Load subagent-done extension so the agent can self-terminate if needed
-        const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
-        parts.push("-e", shellEscape(subagentDonePath));
+        parts.push(...buildChildExtensionArgs());
 
         const sessionId = ctx.sessionManager.getSessionId();
         const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
@@ -2146,6 +2149,31 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         return ["", ...box.render(width)];
       },
     };
+  });
+
+  // /subagents layout [split|tab] — choose where NEW children are placed (session only)
+  pi.registerCommand("subagents", {
+    description: "Subagent layout: /subagents layout [split|tab]",
+    handler: async (args, ctx) => {
+      const [sub, value] = args.trim().split(/\s+/);
+      if (sub !== "layout") {
+        ctx.ui.notify("Usage: /subagents layout [split|tab]", "warning");
+        return;
+      }
+      if (!value) {
+        ctx.ui.notify(
+          `Subagent layout: ${getLayoutMode()} (maxSplitChildren: ${getMaxSplitChildren()})`,
+          "info",
+        );
+        return;
+      }
+      if (value !== "split" && value !== "tab") {
+        ctx.ui.notify("Usage: /subagents layout [split|tab]", "warning");
+        return;
+      }
+      setLayoutMode(value);
+      ctx.ui.notify(`Subagent layout set to ${value} for new children (this session).`, "info");
+    },
   });
 
   // /plan command — start the full planning workflow

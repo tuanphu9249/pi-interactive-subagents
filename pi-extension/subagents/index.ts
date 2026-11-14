@@ -344,15 +344,10 @@ function resolveLaunchBehavior(
  * Resolution order:
  *   1. Explicit `interactive` tool parameter wins.
  *   2. Explicit `interactive` frontmatter field on the agent.
- *   3. Default: the inverse of `auto-exit`. Agents that auto-exit are
- *      autonomous (scout, worker, reviewer) and the parent session should be
- *      woken on stall/recovery transitions. Agents that don't auto-exit are
- *      driven by the user in their own pane (planner, iterate/fork) and
- *      stall pings are noise.
- *
- * When no agent defs exist at all (bare `subagent({ name, task })` call,
- * typical for `/iterate` with `fork: true`), `autoExit` is undefined and the
- * subagent is treated as interactive — matching the intent of iterate.
+ *   3. `fork: true` is interactive (the /iterate path).
+ *   4. An agent with explicit `auto-exit: false` is interactive.
+ *   5. Otherwise autonomous (parent is woken on stall/recovery; the child
+ *      auto-exits when its turn ends).
  */
 function resolveEffectiveInteractive(
   params: Static<typeof SubagentParams>,
@@ -360,7 +355,13 @@ function resolveEffectiveInteractive(
 ): boolean {
   if (params.interactive != null) return params.interactive;
   if (agentDefs?.interactive != null) return agentDefs.interactive;
-  return !(agentDefs?.autoExit ?? false);
+  if (params.fork) return true;
+  return agentDefs?.autoExit === false;
+}
+
+/** Explicit agent `auto-exit` wins; otherwise autonomous (non-interactive) children auto-exit. */
+function resolveEffectiveAutoExit(agentDefs: AgentDefaults | null, interactive: boolean): boolean {
+  return agentDefs?.autoExit ?? !interactive;
 }
 
 function loadAgentDefaults(agentName: string): AgentDefaults | null {
@@ -909,6 +910,7 @@ export const __test__ = {
   resolveEffectiveSessionMode,
   resolveLaunchBehavior,
   resolveEffectiveInteractive,
+  resolveEffectiveAutoExit,
   buildSubagentToolAllowlist,
   buildPiPromptArgs,
   formatWidgetRightLabel,
@@ -952,6 +954,7 @@ async function launchSubagent(
   const effectiveSkills = params.skills ?? agentDefs?.skills;
   const effectiveThinking = agentDefs?.thinking;
   const effectiveInteractive = resolveEffectiveInteractive(params, agentDefs);
+  const effectiveAutoExit = resolveEffectiveAutoExit(agentDefs, effectiveInteractive);
 
   const sessionFile = ctx.sessionManager.getSessionFile();
   if (!sessionFile) throw new Error("No session file");
@@ -1000,10 +1003,10 @@ async function launchSubagent(
   // Build the task message
   // Only full-context fork mode inherits prior conversation state.
   // Blank-session modes need the wrapper instructions and artifact-backed handoff.
-  const modeHint = agentDefs?.autoExit
+  const modeHint = effectiveAutoExit
     ? "Complete your task autonomously."
     : "Complete your task. When finished, call the subagent_done tool. The user can interact with you at any time.";
-  const summaryInstruction = agentDefs?.autoExit
+  const summaryInstruction = effectiveAutoExit
     ? "Your FINAL assistant message should summarize what you accomplished."
     : "Your FINAL assistant message (before calling subagent_done or before the user exits) should summarize what you accomplished.";
   const denySet = resolveDenyTools(agentDefs);
@@ -1141,7 +1144,7 @@ async function launchSubagent(
   if (params.agent) {
     envParts.push(`PI_SUBAGENT_AGENT=${shellEscape(params.agent)}`);
   }
-  if (agentDefs?.autoExit) {
+  if (effectiveAutoExit) {
     envParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
   }
   envParts.push(`PI_SUBAGENT_SESSION=${shellEscape(subagentSessionFile)}`);
@@ -1309,6 +1312,7 @@ async function watchSubagent(
     if (existsSync(sessionFile)) {
       const allEntries = getNewEntries(sessionFile, 0);
       summary =
+        result.summary ??
         findLastAssistantMessage(allEntries) ??
         (result.errorMessage
           ? `Subagent error: ${result.errorMessage}`
@@ -1912,7 +1916,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             }
 
             const allEntries = getNewEntries(params.sessionPath, entryCountBefore);
-            const summary = findLastAssistantMessage(allEntries) ??
+            const summary = result.summary ?? findLastAssistantMessage(allEntries) ??
               (result.errorMessage
                 ? `Subagent error: ${result.errorMessage}`
                 : result.exitCode !== 0

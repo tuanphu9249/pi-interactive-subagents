@@ -930,26 +930,28 @@ describe("subagent discovery", () => {
     });
   });
 
-  it("resolveEffectiveInteractive defaults to the inverse of auto-exit", () => {
-    // Autonomous agents (auto-exit: true) are NOT interactive — parent gets stall pings.
-    assert.equal(
-      testApi.resolveEffectiveInteractive({ name: "A", task: "T" }, { autoExit: true }),
-      false,
-    );
-    // Agents without auto-exit ARE interactive — parent does not receive status transition pings.
-    assert.equal(
-      testApi.resolveEffectiveInteractive({ name: "A", task: "T" }, { autoExit: false }),
-      true,
-    );
-    assert.equal(
-      testApi.resolveEffectiveInteractive({ name: "A", task: "T" }, {}),
-      true,
-    );
-    // Bare spawn with no agent defs (e.g. /iterate fork) is interactive by default.
-    assert.equal(
-      testApi.resolveEffectiveInteractive({ name: "A", task: "T" }, null),
-      true,
-    );
+  it("resolveEffectiveInteractive: plain call is autonomous, fork is interactive", () => {
+    const P = { name: "A", task: "T" };
+    assert.equal(testApi.resolveEffectiveInteractive(P, null), false);
+    assert.equal(testApi.resolveEffectiveInteractive(P, {}), false);
+    assert.equal(testApi.resolveEffectiveInteractive(P, { autoExit: true }), false);
+    assert.equal(testApi.resolveEffectiveInteractive({ ...P, fork: true }, null), true);
+    // Agent with explicit auto-exit: false stays interactive.
+    assert.equal(testApi.resolveEffectiveInteractive(P, { autoExit: false }), true);
+    // Explicit param beats fork.
+    assert.equal(testApi.resolveEffectiveInteractive({ ...P, fork: true, interactive: false }, null), false);
+    assert.equal(testApi.resolveEffectiveInteractive({ ...P, interactive: true }, null), true);
+  });
+
+  it("resolveEffectiveAutoExit: plain call auto-exits, interactive/explicit settings honoured", () => {
+    const P = { name: "A", task: "T" };
+    const auto = (p: any, d: any) =>
+      testApi.resolveEffectiveAutoExit(d, testApi.resolveEffectiveInteractive(p, d));
+    assert.equal(auto(P, null), true);
+    assert.equal(auto({ ...P, fork: true }, null), false);
+    assert.equal(auto({ ...P, interactive: true }, null), false);
+    assert.equal(auto(P, { autoExit: false }), false);
+    assert.equal(auto(P, { autoExit: true, interactive: true }), true);
   });
 
   it("resolveEffectiveInteractive honors explicit frontmatter over the auto-exit default", () => {
@@ -1310,6 +1312,8 @@ describe("hc.ts interpretExitSidecar", () => {
   });
 
   it("decodes done payloads", () => {
+    assert.equal(interpretExitSidecar({ type: "done", summary: "full report" }).summary, "full report");
+    assert.equal(interpretExitSidecar({ type: "done", summary: "  " }).summary, undefined);
     assert.deepEqual(interpretExitSidecar({ type: "done" }), {
       reason: "done",
       exitCode: 0,

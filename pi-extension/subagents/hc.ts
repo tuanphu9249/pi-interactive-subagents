@@ -442,6 +442,8 @@ export interface PollResult {
   exitCode: number;
   /** Ping data if reason is "ping" */
   ping?: { name: string; message: string };
+  /** Report passed to subagent_done via `summary`, if any */
+  summary?: string;
   /** Error message if reason is "error" (auto-retry exhausted, provider overload, etc.) */
   errorMessage?: string;
 }
@@ -466,7 +468,9 @@ function interpretExitSidecar(data: any): PollResult {
         : "Subagent exited with stopReason=error (no errorMessage in sidecar).";
     return { reason: "error", exitCode: 1, errorMessage };
   }
-  return { reason: "done", exitCode: 0 };
+  const summary =
+    typeof data?.summary === "string" && data.summary.trim() !== "" ? data.summary : undefined;
+  return { reason: "done", exitCode: 0, ...(summary ? { summary } : {}) };
 }
 
 export const __pollForExitTest__ = { interpretExitSidecar };

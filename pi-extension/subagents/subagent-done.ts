@@ -302,13 +302,19 @@ export default function (pi: ExtensionAPI) {
     name: "subagent_done",
     label: "Subagent Done",
     description:
-      "Finish: close this session and return your last assistant message to the caller as the summary.",
-    parameters: Type.Object({}),
-    async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+      "Finish and close this session. Pass your complete final report as `summary`; it is returned to the caller.",
+    parameters: Type.Object({
+      summary: Type.Optional(
+        Type.String({
+          description: "Your full final report for the caller. If omitted, your last assistant message is used.",
+        }),
+      ),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const sessionFile = process.env.PI_SUBAGENT_SESSION;
       recorder.subagentDone();
       if (sessionFile) {
-        writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type: "done" }));
+        writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type: "done", ...(params.summary?.trim() ? { summary: params.summary } : {}) }));
       }
       ctx.shutdown();
       return {

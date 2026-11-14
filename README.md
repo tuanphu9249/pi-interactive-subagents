@@ -459,9 +459,14 @@ By default a child Pi loads your full extension setup. Extensions such as tool-d
     "~/.pi/agent/npm/node_modules/pi-claude-bridge",
     "~/.pi/agent/npm/node_modules/cc-safety-net",
     "~/.pi/agent/extensions/commit-guard.ts"
-  ]
+  ],
+  "defaultModel": "claude-bridge/claude-haiku-5-5",
+  "providerMap": { "anthropic": "claude-bridge" }
 }
 ```
+
+- `defaultModel` (`provider/id`): used when neither the `model` param nor the agent frontmatter sets a model.
+- `providerMap`: rewrites the provider prefix of the final model (param > agent > `defaultModel`), keeping any `:thinking` suffix. It also applies to an explicit `model` param. Unmapped providers are untouched. Pi children only; Claude Code children are unchanged.
 
 - Each entry is an absolute or `~/` path to an extension file, or to a package directory (its `package.json` `pi.extensions` entries are used). Missing entries are skipped with a warning.
 - Command order: `-ne`, the allowlist, the agent's `extensions:` frontmatter (comma-separated or YAML list, same path rules), then `subagent-done.ts`.

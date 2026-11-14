@@ -112,6 +112,10 @@ export interface LayoutSettings {
   maxSplitChildren: number;
   /** Extension files/package dirs for lean children. Unset = children inherit everything. */
   childExtensions?: string[];
+  /** Model used when neither the `model` param nor the agent frontmatter sets one. Format: "provider/id". */
+  defaultModel?: string;
+  /** Provider prefix rewrites, e.g. {"anthropic": "claude-bridge"}. Applied to the final model. */
+  providerMap?: Record<string, string>;
 }
 
 export function parseLayoutSettings(raw: unknown): Partial<LayoutSettings> {
@@ -124,6 +128,14 @@ export function parseLayoutSettings(raw: unknown): Partial<LayoutSettings> {
   }
   if (Array.isArray(r.childExtensions)) {
     out.childExtensions = r.childExtensions.filter((x): x is string => typeof x === "string" && x.trim() !== "");
+  }
+  if (typeof r.defaultModel === "string" && r.defaultModel.trim() !== "") out.defaultModel = r.defaultModel.trim();
+  if (r.providerMap && typeof r.providerMap === "object" && !Array.isArray(r.providerMap)) {
+    const map: Record<string, string> = {};
+    for (const [from, to] of Object.entries(r.providerMap as Record<string, unknown>)) {
+      if (typeof to === "string" && from.trim() !== "" && to.trim() !== "") map[from.trim()] = to.trim();
+    }
+    out.providerMap = map;
   }
   return out;
 }
@@ -164,6 +176,27 @@ function currentSettings(): LayoutSettings {
 /** Configured lean-child extension entries, or undefined when children inherit everything. */
 export function getChildExtensionSettings(): string[] | undefined {
   return currentSettings().childExtensions;
+}
+
+/** Rewrite the provider prefix of "provider/id[:thinking]" when the provider is a providerMap key. */
+export function applyProviderMap(model: string, providerMap: Record<string, string> | undefined): string {
+  const slash = model.indexOf("/");
+  if (slash < 0 || !providerMap) return model;
+  const mapped = providerMap[model.slice(0, slash)];
+  return mapped ? mapped + model.slice(slash) : model;
+}
+
+/**
+ * Effective child model: param > agent frontmatter > settings.defaultModel, then providerMap.
+ * Returns undefined when nothing is set (child uses pi's own default).
+ */
+export function resolveEffectiveModel(
+  paramModel: string | undefined,
+  agentModel: string | undefined,
+  settings: Pick<LayoutSettings, "defaultModel" | "providerMap"> = currentSettings(),
+): string | undefined {
+  const model = paramModel ?? agentModel ?? settings.defaultModel;
+  return model ? applyProviderMap(model, settings.providerMap) : undefined;
 }
 
 export function getLayoutMode(): LayoutMode {

@@ -30,6 +30,8 @@ import {
   setLayoutMode,
   parseLayoutSettings,
   __setHcSettings,
+  applyProviderMap,
+  resolveEffectiveModel,
 } from "../pi-extension/subagents/hc.ts";
 import { resolveChildExtensions, parseExtensionsField } from "../pi-extension/subagents/child-extensions.ts";
 import {
@@ -2400,5 +2402,43 @@ describe("lean child extensions", () => {
     handlers.session_shutdown({ reason: "reload" }, {});
     assert.ok(!calls.some((c) => c.args[0] === "kill" && c.args[1] === "t78"));
     assert.equal(runningSubagents.size, 0);
+  });
+});
+
+describe("model resolution settings", () => {
+  it("parses defaultModel and providerMap", () => {
+    assert.deepEqual(
+      parseLayoutSettings({ defaultModel: "claude-bridge/claude-haiku-5-5", providerMap: { anthropic: "claude-bridge" } }),
+      { defaultModel: "claude-bridge/claude-haiku-5-5", providerMap: { anthropic: "claude-bridge" } },
+    );
+    assert.deepEqual(parseLayoutSettings({ defaultModel: "  ", providerMap: ["x"] }), {});
+    assert.deepEqual(parseLayoutSettings({ providerMap: { anthropic: 1, "": "x", ok: "y" } }), { providerMap: { ok: "y" } });
+  });
+
+  it("precedence: param > agent > defaultModel", () => {
+    const settings = { defaultModel: "openai/gpt-x" };
+    assert.equal(resolveEffectiveModel("param/a", "agent/b", settings), "param/a");
+    assert.equal(resolveEffectiveModel(undefined, "agent/b", settings), "agent/b");
+    assert.equal(resolveEffectiveModel(undefined, undefined, settings), "openai/gpt-x");
+  });
+
+  it("providerMap rewrites the provider prefix of the final model, keeping :thinking", () => {
+    const settings = { providerMap: { anthropic: "claude-bridge" } };
+    assert.equal(resolveEffectiveModel(undefined, "anthropic/claude-opus-4-6", settings), "claude-bridge/claude-opus-4-6");
+    assert.equal(resolveEffectiveModel("anthropic/claude-sonnet-4-6:high", undefined, settings), "claude-bridge/claude-sonnet-4-6:high");
+    assert.equal(resolveEffectiveModel(undefined, undefined, { defaultModel: "anthropic/claude-haiku-4-5", providerMap: { anthropic: "claude-bridge" } }), "claude-bridge/claude-haiku-4-5");
+  });
+
+  it("unmapped provider is untouched", () => {
+    const settings = { providerMap: { anthropic: "claude-bridge" } };
+    assert.equal(resolveEffectiveModel("openai/gpt-x", undefined, settings), "openai/gpt-x");
+    assert.equal(applyProviderMap("openai/gpt-x", { anthropic: "claude-bridge" }), "openai/gpt-x");
+    assert.equal(applyProviderMap("no-slash", { anthropic: "claude-bridge" }), "no-slash");
+  });
+
+  it("no settings keeps old behaviour", () => {
+    assert.equal(resolveEffectiveModel(undefined, undefined, {}), undefined);
+    assert.equal(resolveEffectiveModel("anthropic/claude-opus-4-6", undefined, {}), "anthropic/claude-opus-4-6");
+    assert.equal(resolveEffectiveModel(undefined, "anthropic/claude-haiku-4-5", {}), "anthropic/claude-haiku-4-5");
   });
 });

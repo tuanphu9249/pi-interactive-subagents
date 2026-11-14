@@ -32,6 +32,7 @@ import {
   setLayoutMode,
   getMaxSplitChildren,
   getChildExtensionSettings,
+  resolveEffectiveModel,
 } from "./hc.ts";
 
 import {
@@ -949,7 +950,7 @@ async function launchSubagent(
   const id = Math.random().toString(16).slice(2, 10);
 
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
-  const effectiveModel = params.model ?? agentDefs?.model;
+  const requestedModel = params.model ?? agentDefs?.model;
   const effectiveTools = params.tools ?? agentDefs?.tools;
   const effectiveSkills = params.skills ?? agentDefs?.skills;
   const effectiveThinking = agentDefs?.thinking;
@@ -1031,8 +1032,8 @@ async function launchSubagent(
       cmdParts.push("--plugin-dir", shellEscape(pluginDir));
     }
 
-    if (effectiveModel) {
-      cmdParts.push("--model", shellEscape(effectiveModel));
+    if (requestedModel) {
+      cmdParts.push("--model", shellEscape(requestedModel));
     }
 
     const sp = params.systemPrompt ?? agentDefs.body;
@@ -1098,6 +1099,7 @@ async function launchSubagent(
 
   parts.push(...buildChildExtensionArgs(agentDefs?.extensions));
 
+  const effectiveModel = resolveEffectiveModel(params.model, agentDefs?.model);
   if (effectiveModel) {
     const model = effectiveThinking ? `${effectiveModel}:${effectiveThinking}` : effectiveModel;
     parts.push("--model", shellEscape(model));

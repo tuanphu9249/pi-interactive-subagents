@@ -902,6 +902,7 @@ function resolveResumeLaunchBehavior(params: { autoExit?: boolean }): { autoExit
 }
 
 export const __test__ = {
+  getModuleAbortSignal,
   borderLine,
   getShellReadyDelayMs,
   renderSubagentWidgetLines,
@@ -1418,6 +1419,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     }
     const moduleAbort = (globalThis as any)[POLL_ABORT_KEY] as AbortController | undefined;
     if (moduleAbort) moduleAbort.abort();
+    // /new, /resume and /fork keep this module loaded, so the next session needs a live signal.
+    // Without it every later spawn aborts at its first poll. /reload replaces it again on import.
+    (globalThis as any)[POLL_ABORT_KEY] = new AbortController();
     const quitting = (event as { reason?: string } | undefined)?.reason === "quit";
     for (const [_id, agent] of runningSubagents) {
       agent.abortController?.abort();

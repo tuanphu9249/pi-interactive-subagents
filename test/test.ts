@@ -2403,6 +2403,21 @@ describe("lean child extensions", () => {
     assert.ok(!calls.some((c) => c.args[0] === "kill" && c.args[1] === "t78"));
     assert.equal(runningSubagents.size, 0);
   });
+
+  it("session_shutdown stops old pollers but new spawns can still be watched", () => {
+    // /new keeps the loaded module: the next session's watchers use the same module abort signal.
+    const handlers: Record<string, Function> = {};
+    const fakePi: any = { on: (n: string, h: Function) => (handlers[n] = h), registerTool() {}, registerCommand() {}, registerMessageRenderer() {}, registerShortcut() {} };
+    try {
+      (subagentsModule as any).default(fakePi);
+    } catch {}
+    const before = (subagentsModule as any).__test__.getModuleAbortSignal() as AbortSignal;
+    assert.equal(before.aborted, false);
+    handlers.session_shutdown({ reason: "new" }, {});
+    assert.equal(before.aborted, true);
+    const after = (subagentsModule as any).__test__.getModuleAbortSignal() as AbortSignal;
+    assert.equal(after.aborted, false);
+  });
 });
 
 describe("model resolution settings", () => {

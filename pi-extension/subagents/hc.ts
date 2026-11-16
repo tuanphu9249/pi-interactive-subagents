@@ -420,16 +420,6 @@ export function createSurface(name: string, meta?: SurfaceMeta): string {
   return terminalId;
 }
 
-export function renameCurrentTab(title: string): void {
-  requireMuxBackend();
-  herdrDo("tab.rename", ["--id", locateParent().tabId, "--name", title]);
-}
-
-export function renameWorkspace(title: string): void {
-  requireMuxBackend();
-  herdrDo("space.rename", ["--id", locateParent().spaceId, "--name", title]);
-}
-
 // ---------------------------------------------------------------------------
 // terminal I/O
 // ---------------------------------------------------------------------------

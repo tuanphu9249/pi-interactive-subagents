@@ -26,8 +26,6 @@ import {
   getMuxBackend,
   sendEscape,
   shellEscape,
-  renameCurrentTab,
-  renameWorkspace,
   readScreen,
   getLayoutMode,
   setLayoutMode,
@@ -2500,15 +2498,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         return;
       }
 
-      // Rename workspace and tab to show this is a planning session
-      if (isMuxAvailable()) {
-        try {
-          const label = task.length > 40 ? task.slice(0, 40) + "..." : task;
-          renameWorkspace(`🎯 ${label}`);
-          renameCurrentTab(`🎯 Plan: ${label}`);
-        } catch {
-          // non-critical -- do not block the plan
-        }
+      // Name the session from the plan task (the dotfiles session-naming extension listens).
+      // Never rename the workspace.
+      try {
+        pi.events?.emit("session-naming:hint", { text: task, tabPrefix: "🎯 " });
+      } catch {
+        // non-critical -- do not block the plan
       }
 
       // Load the plan skill from the subagents extension directory

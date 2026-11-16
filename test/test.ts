@@ -93,7 +93,9 @@ function createMockExtensionApi() {
   const registeredMessageRenderers: Array<any> = [];
   const sentUserMessages: string[] = [];
   const sentMessages: Array<any> = [];
+  const emitted: Array<{ ch: string; d: any; sentBefore: number }> = [];
   return {
+    emitted,
     registeredTools,
     registeredCommands,
     registeredMessageRenderers,
@@ -101,6 +103,14 @@ function createMockExtensionApi() {
     sentMessages,
     api: {
       on() {},
+      events: {
+        emit(ch: string, d: any) {
+          emitted.push({ ch, d, sentBefore: sentUserMessages.length });
+        },
+        on() {
+          return () => {};
+        },
+      },
       registerTool(tool: any) {
         registeredTools.push(tool);
       },
@@ -1378,6 +1388,24 @@ describe("commands", () => {
     assert.equal(sentUserMessages.length, 1);
     assert.match(sentUserMessages[0], /fork: true/);
     assert.match(sentUserMessages[0], /name: "Iterate"/);
+  });
+
+  it("/plan emits a naming hint before sending the plan message", () => {
+    const { api, registeredCommands, sentUserMessages, emitted } = createMockExtensionApi();
+
+    (subagentsModule as any).default(api);
+
+    const plan = registeredCommands.find((command) => command.name === "plan");
+    assert.ok(plan, "expected /plan to be registered");
+
+    plan.handler("Improve naming", { ui: { notify() {} } });
+
+    assert.equal(emitted.length, 1);
+    assert.equal(emitted[0].ch, "session-naming:hint");
+    assert.equal(emitted[0].d.text, "Improve naming");
+    assert.equal(emitted[0].d.tabPrefix, "🎯 ");
+    assert.equal(emitted[0].sentBefore, 0, "emit must precede sendUserMessage");
+    assert.equal(sentUserMessages.length, 1);
   });
 });
 

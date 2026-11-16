@@ -34,7 +34,15 @@ import {
   getMaxSplitChildren,
   getChildExtensionSettings,
   resolveEffectiveModel,
+  setTerminalLabels,
 } from "./hc.ts";
+import {
+  TaskController,
+  TASK_STATUSES,
+  TASK_TOOL_NAME,
+  formatTaskList,
+  type TaskStatus,
+} from "./tasks.ts";
 
 import {
   findLastAssistantMessage,
@@ -133,6 +141,9 @@ const SubagentParams = Type.Object({
       description:
         "Claude Code session ID to resume",
     }),
+  ),
+  taskId: Type.Optional(
+    Type.String({ description: "Pending task id to start with this child (see `task`)" }),
   ),
 });
 
@@ -490,6 +501,8 @@ interface SubagentResult {
   /** Provider/agent error message when auto-retry exhausted (overload, rate limit, etc.). */
   errorMessage?: string;
   ping?: { name: string; message: string };
+  /** The terminal ended without a subagent_done result (crash or kill). */
+  noResult?: boolean;
 }
 
 /**
@@ -514,6 +527,10 @@ interface RunningSubagent {
     error?: string;
   };
   abortController?: AbortController;
+  /** Session task this child works on (`subagent({ taskId })`). */
+  taskId?: string;
+  /** `subagent_control` stop was accepted for this child. */
+  stopped?: boolean;
   cli?: string;
   sentinelFile?: string;
   statusState: SubagentStatusState;
@@ -528,6 +545,26 @@ interface RunningSubagent {
 
 /** All currently running subagents, keyed by id. */
 const runningSubagents = new Map<string, RunningSubagent>();
+
+/** Session task list. Set by the extension factory in the parent session only. */
+let taskController: TaskController | null = null;
+
+/** Status a child's task gets when the child ends. Null: leave the task alone. */
+function taskStatusForResult(
+  running: Pick<RunningSubagent, "stopped">,
+  result: Pick<SubagentResult, "ping" | "error" | "errorMessage" | "exitCode" | "noResult">,
+): TaskStatus | null {
+  if (result.ping) return null; // the child asked for help; the task stays in progress
+  if (running.stopped) return "cancelled";
+  if (result.error === "cancelled") return null; // the parent session ended; unknown outcome
+  if (result.error || result.errorMessage || result.noResult || result.exitCode !== 0) return "failed";
+  return "completed";
+}
+
+function settleTaskForResult(running: RunningSubagent, result: SubagentResult): void {
+  const status = taskStatusForResult(running, result);
+  if (status) taskController?.settle(running.taskId, status);
+}
 
 // ── Widget management ──
 
@@ -950,6 +987,7 @@ function handleSubagentStop(params: { id?: string; name?: string }) {
     const text = `Failed to stop subagent "${running.name}": ${error?.message ?? String(error)}`;
     return textResult(text, { error: text, id: running.id, name: running.name });
   }
+  running.stopped = true;
   return textResult(
     `Stop requested for subagent "${running.name}". Its partial result will be delivered as a normal completion.`,
     { id: running.id, name: running.name, status: "stop_requested" },
@@ -1100,6 +1138,9 @@ export const __test__ = {
   resolveResumeLaunchBehavior,
   runningSubagents,
   formatElapsed,
+  taskStatusForResult,
+  settleTaskForResult,
+  getTaskController: () => taskController,
 };
 
 function startWidgetRefresh() {
@@ -1157,7 +1198,14 @@ async function launchSubagent(
   // Use pre-created surface (parallel mode) or create a new one.
   // For new surfaces, pause briefly so the shell is ready before sending the command.
   const surfacePreCreated = !!options?.surface;
-  const surface = options?.surface ?? createSurface(params.name, { role: params.agent, task: params.task });
+  const taskForLabels = params.taskId ? taskController?.store.get(params.taskId) : undefined;
+  const surface =
+    options?.surface ??
+    createSurface(params.name, {
+      role: params.agent,
+      task: params.task,
+      ...(taskForLabels ? { taskId: taskForLabels.id, taskSubject: taskForLabels.subject } : {}),
+    });
   if (!surfacePreCreated) {
     await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
   }
@@ -1397,6 +1445,7 @@ async function launchSubagent(
     launchScriptFile,
     activityFile,
     inboxFile,
+    ...(params.taskId ? { taskId: params.taskId } : {}),
     interactive: effectiveInteractive,
     statusState: createStatusState({
       source: "pi",
@@ -1519,6 +1568,7 @@ async function watchSubagent(
       exitCode: result.exitCode,
       elapsed,
       ping: result.ping,
+      ...(result.reason === "sentinel" ? { noResult: true } : {}),
       ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
     };
   } catch (err: any) {
@@ -1579,8 +1629,34 @@ function buildChildExtensionArgs(agentExtensions?: string[]): string[] {
 
 export default function subagentsExtension(pi: ExtensionAPI) {
   // Capture the UI context for widget updates
+  // The task list lives in the parent session only. A child never gets the
+  // `task` tool, so it has no controller.
+  const isChild = !!process.env.PI_SUBAGENT_ID?.trim();
+  taskController = isChild
+    ? null
+    : new TaskController({
+        appendEntry: (customType, data) => pi.appendEntry(customType, data),
+        setWidget: (lines) => {
+          if (latestCtx?.hasUI) latestCtx.ui.setWidget("tasks", lines);
+        },
+        writeLabels: setTerminalLabels,
+        parentTerminal: () => process.env.HC_TERMINAL_ID,
+      });
+  const rebuildTasks = (ctx: ExtensionContext) => {
+    try {
+      taskController?.rebuild(ctx.sessionManager.getBranch());
+    } catch {}
+  };
+
   pi.on("session_start", (_event, ctx) => {
     latestCtx = ctx;
+    rebuildTasks(ctx);
+  });
+
+  // /tree moves to another branch: rebuild the task list from that branch.
+  pi.on("session_tree", (_event, ctx) => {
+    latestCtx = ctx;
+    rebuildTasks(ctx);
   });
 
   // Clean up on session shutdown
@@ -1647,6 +1723,20 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           };
         }
 
+        // The task must exist and be pending.
+        let claimedTask = false;
+        if (params.taskId !== undefined) {
+          const task = taskController?.store.get(params.taskId);
+          const problem = !task
+            ? `Unknown task id "${params.taskId}".`
+            : task.status !== "pending"
+              ? `Task #${task.id} is ${task.status}, not pending.`
+              : null;
+          if (problem) {
+            return { content: [{ type: "text", text: `Error: ${problem}` }], details: { error: problem } };
+          }
+        }
+
         // Validate prerequisites
         if (!isMuxAvailable()) {
           return muxUnavailableResult();
@@ -1664,8 +1754,21 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           };
         }
 
+        // Claim before the async launch, so a parallel spawn with the same taskId is rejected.
+        if (params.taskId !== undefined && taskController) {
+          taskController.claim(params.taskId, params.name);
+          claimedTask = true;
+        }
+
         // Launch the subagent (creates pane, sends command)
-        const running = await launchSubagent(params, ctx);
+        let running: RunningSubagent;
+        try {
+          running = await launchSubagent(params, ctx);
+        } catch (error) {
+          if (claimedTask) taskController?.release(params.taskId!);
+          throw error;
+        }
+        if (claimedTask) taskController?.setOwner(params.taskId!, `${running.name} (${running.id})`);
 
         // Create a separate AbortController for the watcher
         // (the tool's signal completes when we return)
@@ -1680,6 +1783,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         watchSubagent(running, watcherAbort.signal)
           .then((result) => {
             updateWidget(); // reflect removal from Map immediately
+            settleTaskForResult(running, result);
 
             if (result.ping) {
               // Subagent is requesting help — steer a ping message with session path for resume
@@ -1724,6 +1828,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           })
           .catch((err) => {
             updateWidget();
+            taskController?.settle(running.taskId, running.stopped ? "cancelled" : "failed");
             pi.sendMessage(
               {
                 customType: "subagent_result",
@@ -1752,6 +1857,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             name: params.name,
             task: params.task,
             agent: params.agent,
+            ...(params.taskId ? { taskId: params.taskId } : {}),
             sessionFile: running.sessionFile,
             launchScriptFile: running.launchScriptFile,
             status: "started",
@@ -1814,6 +1920,44 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         return new Text(theme.fg("dim", text), 0, 0);
       },
     });
+
+  // ── task tool (parent only: registered where `subagent` is, never in a child) ──
+  if (taskController && shouldRegister("subagent")) {
+    const controller = taskController;
+    const ids = (description: string) => Type.Optional(Type.Array(Type.String(), { description }));
+    pi.registerTool({
+      name: TASK_TOOL_NAME,
+      label: "Task",
+      description:
+        "Session task list. list marks tasks ready (pending, blockers completed). subagent({taskId}) sets in_progress, completed, failed or cancelled itself.",
+      parameters: Type.Object({
+        action: Type.Unsafe<"create" | "update" | "get" | "list">({
+          type: "string",
+          enum: ["create", "update", "get", "list"],
+        }),
+        id: Type.Optional(Type.String()),
+        subject: Type.Optional(Type.String({ description: "Short, imperative" })),
+        description: Type.Optional(Type.String()),
+        status: Type.Optional(Type.Unsafe<TaskStatus>({ type: "string", enum: [...TASK_STATUSES] })),
+        blockedBy: ids("create: blocker ids"),
+        addBlockedBy: ids("update"),
+        removeBlockedBy: ids("update"),
+        owner: Type.Optional(Type.String()),
+        activeForm: Type.Optional(Type.String({ description: "Widget text while in progress" })),
+      }),
+
+      async execute(_toolCallId, params) {
+        return controller.run(params as any);
+      },
+    });
+
+    pi.registerCommand("tasks", {
+      description: "Show the session task list",
+      handler: async (_args, ctx) => {
+        ctx.ui.notify(formatTaskList(controller.store), "info");
+      },
+    });
+  }
 
   // ── subagent_control tool ──
   if (shouldRegister("subagent_control"))

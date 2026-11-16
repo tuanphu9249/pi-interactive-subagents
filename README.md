@@ -42,7 +42,7 @@ Herdr moves focus to a new split pane; the extension returns focus right after e
 { "hc-subagents": { "layout": "split", "maxSplitChildren": 4 } }
 ```
 
-Change the layout for the rest of the session with `/subagents layout split|tab` (no argument shows the current layout). Each child terminal gets `hc` labels: `pi.subagent`, `pi.role`, `pi.name`, `pi.parent`, `pi.task`, `pi.started`, `pi.activity` (see [Terminal labels](#terminal-labels)).
+Change the layout for the rest of the session with `/subagents layout split|tab` (no argument shows the current layout). Each child terminal gets `hc` labels: `pi.subagent`, `pi.role`, `pi.name`, `pi.parent`, `pi.task`, `pi.started`, `pi.activity`, and with `taskId` also `pi.taskid`, `pi.tasksubject` (see [Terminal labels](#terminal-labels)).
 
 If your shell startup is slow and subagent commands sometimes get dropped before the prompt is ready, set `PI_SUBAGENT_SHELL_READY_DELAY_MS` to a higher value (defaults to `500`):
 
@@ -56,13 +56,14 @@ Child panes start a clean bash and get the launch command by `hc send`. Note: th
 
 ### Extensions
 
-**Subagents** — 3 main-session tools + 4 commands, plus 1 subagent-only tool:
+**Subagents** — 4 main-session tools + 5 commands, plus 1 subagent-only tool:
 
 | Tool                 | Description                                                                                 |
 | -------------------- | ------------------------------------------------------------------------------------------- |
 | `subagent`           | Spawn a sub-agent in a dedicated multiplexer pane (async — returns immediately)             |
 | `subagent_control`   | Steer, interrupt or stop a running Pi-backed subagent, or list running subagents and agent definitions |
 | `subagent_resume`    | Resume a previous sub-agent session (async)                                                 |
+| `task`               | Session task list: create, update, get, list. See [Tasks](#tasks)                           |
 
 | Command                    | Description                          |
 | -------------------------- | ------------------------------------ |
@@ -70,14 +71,15 @@ Child panes start a clean bash and get the launch command by `hc send`. Note: th
 | `/iterate`                 | Fork into a subagent for quick fixes |
 | `/subagent <agent> <task>` | Spawn a named agent directly         |
 | `/steer <name> <text>`     | Send a message to a running subagent |
+| `/tasks`                   | Show the session task list           |
 
 ### Bundled Agents
 
 | Agent             | Model                  | Role                                                                                     |
 | ----------------- | ---------------------- | ---------------------------------------------------------------------------------------- |
-| **planner**       | Opus (medium thinking) | Brainstorming — clarifies requirements, explores approaches, writes plans, creates todos |
+| **planner**       | Opus (medium thinking) | Brainstorming — clarifies requirements, explores approaches, writes plans with a Tasks section |
 | **scout**         | Haiku                  | Fast codebase reconnaissance — maps files, patterns, conventions                         |
-| **worker**        | Sonnet                 | Implements tasks from todos — writes code, runs tests, makes polished commits            |
+| **worker**        | Sonnet                 | Implements one task from the plan — writes code, runs tests, makes polished commits            |
 | **reviewer**      | Opus (medium thinking) | Reviews code for bugs, security issues, correctness                                      |
 | **visual-tester** | Sonnet                 | Visual QA via Chrome CDP — screenshots, responsive testing, interaction testing          |
 
@@ -171,6 +173,7 @@ subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer"
 | `skills`               | string  | —              | Comma-separated skill names                                                                       |
 | `tools`                | string  | —              | Comma-separated tool names                                                                        |
 | `cwd`                  | string  | —              | Working directory for the sub-agent (see [Role Folders](#role-folders))                           |
+| `taskId`               | string  | —              | Id of a `pending` task in the session task list. The spawn is rejected if the task does not exist or is not pending. See [Tasks](#tasks) |
 
 ---
 
@@ -203,9 +206,62 @@ After an interrupt, the widget immediately moves the child back to `waiting`, an
 
 ---
 
+## Tasks
+
+The `task` tool keeps one task list per Pi session. Only the parent session writes it. Children get no `task` tool: it is registered only where `subagent` is registered, and never in a child.
+
+```typescript
+task({ action: "create", subject: "Add the parser", description: "...", blockedBy: ["1"] });
+task({ action: "update", id: "2", status: "completed", addBlockedBy: ["3"], removeBlockedBy: ["1"] });
+task({ action: "get", id: "2" });
+task({ action: "list" });
+```
+
+| Field         | Description                                                                              |
+| ------------- | ---------------------------------------------------------------------------------------- |
+| `id`          | String integer per session: `"1"`, `"2"`, ...                                            |
+| `subject`     | Short, imperative                                                                        |
+| `description` | Optional                                                                                 |
+| `status`      | `pending`, `in_progress`, `completed`, `failed`, `cancelled`                             |
+| `blockedBy`   | Ids of tasks that must be `completed` first                                              |
+| `owner`       | Child name and id, set when a child starts the task                                      |
+| `activeForm`  | Optional text for the widget while the task is in progress                               |
+
+`list` marks a task `ready` when it is `pending` and all `blockedBy` tasks are `completed`. Unknown ids, unknown blockers and dependency cycles are rejected with an error and change nothing.
+
+### Automatic status changes
+
+Pass `taskId` to `subagent` and the fork sets the status for you:
+
+| Event                                                      | New status                                   |
+| ---------------------------------------------------------- | -------------------------------------------- |
+| `subagent({ ..., taskId })`                                | `in_progress`; `owner` = child name and id   |
+| The child result arrives                                   | `completed`                                  |
+| The child fails, or exits without a result                 | `failed`                                     |
+| `subagent_control` with `action: "stop"`                   | `cancelled`                                  |
+
+A change applies only while the task is `in_progress`, so a status you set by hand is not overwritten. If the child calls `caller_ping`, or the parent session ends (`/new`, `/reload`), the task stays `in_progress`. A `taskId` that is unknown or not `pending` is rejected before any terminal is created.
+
+### Storage and display
+
+A `task` call stores the full list in its tool result `details`. A change made by the fork (a spawn or a child result) is stored as a `task-snapshot` custom entry. On session start, resume, fork and `/tree` navigation the list is rebuilt from the last snapshot on the current branch.
+
+A widget above the editor shows `Tasks <completed>/<total>` (cancelled tasks are not counted), then one line per open task: in progress, then ready, then blocked. It shows at most 6 lines and is hidden when the list is empty. `/tasks` prints the full list.
+
 ## Terminal labels
 
 Each child terminal carries these `hc` labels: `pi.subagent`, `pi.role`, `pi.name`, `pi.parent`, `pi.task`, `pi.started` (spawn time, epoch ms) and `pi.activity` (current step, 80 characters max, e.g. `bash: npm test`, `thinking`, `waiting`). The child updates `pi.activity` itself, at most once per 2 seconds and only when the text changes.
+
+A child spawned with `taskId` also gets `pi.taskid` (the task id) and `pi.tasksubject` (the subject, 80 characters max).
+
+The parent terminal (`$HC_TERMINAL_ID`) gets two labels after every task change:
+
+| Label         | Value                                                                                                                              |
+| ------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `pi.tasks`    | `<completed>/<total>`, for example `3/7`. `total` does not count `cancelled` tasks.                                                |
+| `pi.tasknow`  | `#<id> <subject>` of the first `in_progress` task that has no child owner, plus ` +N` for N more. Removed when there is none.      |
+
+An empty value removes a label (`hc label <terminal> key=`). With an empty task list both parent labels are removed. A failed `hc label` call never fails the tool; the next change tries again.
 
 ---
 
@@ -254,8 +310,8 @@ The `/plan` command orchestrates a full planning-to-implementation pipeline.
 ```
 Phase 1: Investigation    → Quick codebase scan
 Phase 2: Planning         → Interactive planner subagent (user collaborates)
-Phase 3: Review Plan      → Confirm todos, adjust if needed
-Phase 4: Execute          → Scout + sequential workers implement todos
+Phase 3: Review Plan      → Confirm the plan's Tasks section, create tasks with `task`
+Phase 4: Execute          → Scout + sequential workers, one per task (`subagent({ taskId })`)
 Phase 5: Review           → Reviewer subagent checks all changes
 ```
 
@@ -499,7 +555,7 @@ Every sub-agent session displays a compact tools widget showing available and de
 ```
 [scout] — 12 tools · 4 denied  (Ctrl+J)              ← collapsed
 [scout] — 12 available  (Ctrl+J to collapse)          ← expanded
-  read, bash, edit, write, todo, ...
+  read, bash, edit, write, ...
   denied: subagent, subagent_control, ...
 ```
 

@@ -273,6 +273,10 @@ export interface SurfaceMeta {
   role?: string;
   /** Task text; truncated to 120 chars, single line. */
   task?: string;
+  /** Session task id this child works on. Sets pi.taskid and pi.tasksubject. */
+  taskId?: string;
+  /** Subject of that task; label value is cut to 80 chars. */
+  taskSubject?: string;
 }
 
 const panes = new Map<string, string>(); // terminalId -> paneId
@@ -380,16 +384,27 @@ function createTabChild(parent: TerminalLocation): string {
 
 function applyLabels(terminalId: string, name: string, meta?: SurfaceMeta): void {
   const task = (meta?.task ?? "").replace(/\s+/g, " ").trim().slice(0, 120);
-  hc([
-    "label",
-    terminalId,
+  const labels = [
     "pi.subagent=1",
     `pi.role=${meta?.role?.trim() || "none"}`,
     `pi.name=${name.replace(/\s+/g, " ").trim()}`,
     `pi.parent=${process.env.HC_TERMINAL_ID ?? ""}`,
     `pi.task=${task}`,
     `pi.started=${Date.now()}`,
-  ]);
+  ];
+  if (meta?.taskId) {
+    const subject = (meta.taskSubject ?? "").replace(/\s+/g, " ").trim().slice(0, 80);
+    labels.push(`pi.taskid=${meta.taskId}`, `pi.tasksubject=${subject}`);
+  }
+  hc(["label", terminalId, ...labels]);
+}
+
+/**
+ * Set labels on a terminal (`hc label <t> k=v...`). An empty value removes the
+ * label (`k=`). Throws when `hc` fails: callers decide.
+ */
+export function setTerminalLabels(terminalId: string, labels: Record<string, string>): void {
+  hc(["label", terminalId, ...Object.entries(labels).map(([k, v]) => `${k}=${v.replace(/\s+/g, " ").trim()}`)]);
 }
 
 /**

@@ -2332,6 +2332,19 @@ describe("hc.ts Herdr backend", () => {
     assert.equal(calls[idx + 1].args[1], "pane.focus");
   });
 
+  it("labels a child with pi.taskid and pi.tasksubject (80 chars max)", () => {
+    createSurface("a", { task: "t", taskId: "4", taskSubject: `Do   the\nthing ${"x".repeat(100)}` });
+    createSurface("b", { task: "t" });
+    const labels = calls.filter((c) => c.file === "hc" && c.args[0] === "label");
+    assert.equal(labels.length, 2);
+    const withTask = labels[0].args;
+    assert.ok(withTask.includes("pi.taskid=4"));
+    const subject = withTask.find((a) => a.startsWith("pi.tasksubject="))!.slice("pi.tasksubject=".length);
+    assert.equal(subject.length, 80);
+    assert.ok(subject.startsWith("Do the thing x"));
+    assert.ok(!labels[1].args.some((a) => a.startsWith("pi.taskid=") || a.startsWith("pi.tasksubject=")));
+  });
+
   describe("focus restore", () => {
     const base = (statusImpl: () => string) => {
       __setHcExec({
@@ -2756,5 +2769,444 @@ describe("steer.ts", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+
+describe("task tool", () => {
+  const savedEnv = {
+    id: process.env.PI_SUBAGENT_ID,
+    term: process.env.HC_TERMINAL_ID,
+    deny: process.env.PI_DENY_TOOLS,
+  };
+  let calls: { file: string; args: string[] }[];
+
+  beforeEach(() => {
+    calls = [];
+    delete process.env.PI_SUBAGENT_ID;
+    delete process.env.PI_DENY_TOOLS;
+    process.env.HC_TERMINAL_ID = "t1";
+    __resetHcState();
+    __setHcExec({
+      sync: (file, args) => {
+        calls.push({ file, args });
+        return "";
+      },
+      async: async () => "",
+    });
+  });
+  afterEach(() => {
+    __setHcExec(null);
+    restoreEnvVar("PI_SUBAGENT_ID", savedEnv.id);
+    restoreEnvVar("HC_TERMINAL_ID", savedEnv.term);
+    restoreEnvVar("PI_DENY_TOOLS", savedEnv.deny);
+  });
+
+  const labelCalls = () => calls.filter((c) => c.file === "hc" && c.args[0] === "label");
+  const lastLabel = () => labelCalls().at(-1)?.args.slice(2);
+
+  /** Load the extension with a fake Pi that records handlers, tools and custom entries. */
+  function setup(branch: any[] = []) {
+    const handlers: Record<string, Function> = {};
+    const tools: any[] = [];
+    const commands: Record<string, any> = {};
+    const entries: Array<{ type: string; data: any }> = [];
+    const widgets: Array<string[] | undefined> = [];
+    const notes: string[] = [];
+    const pi: any = {
+      on: (n: string, h: Function) => (handlers[n] = h),
+      registerTool: (t: any) => tools.push(t),
+      registerCommand: (n: string, c: any) => (commands[n] = c),
+      registerMessageRenderer() {},
+      registerShortcut() {},
+      appendEntry: (type: string, data: any) => entries.push({ type, data }),
+    };
+    const state = { branch };
+    const ctx: any = {
+      hasUI: true,
+      ui: { setWidget: (_k: string, lines: string[] | undefined) => widgets.push(lines), notify: (m: string) => notes.push(m) },
+      sessionManager: { getBranch: () => state.branch },
+    };
+    (subagentsModule as any).default(pi);
+    const tool = tools.find((t) => t.name === "task");
+    const run = (params: any) => tool.execute("id", params, undefined, undefined, ctx);
+    return { handlers, tools, commands, entries, widgets, notes, ctx, state, tool, run, pi };
+  }
+
+  describe("store rules", () => {
+    it("creates, updates and gets tasks with string integer ids", async () => {
+      const { run } = setup();
+      const a = await run({ action: "create", subject: "  Write   code ", description: "details" });
+      assert.equal(a.details.taskId, "1");
+      assert.match(a.content[0].text, /Created #1: Write code/);
+      await run({ action: "create", subject: "Review" });
+      const upd = await run({ action: "update", id: "2", subject: "Review it", activeForm: "Reviewing", owner: "me" });
+      assert.match(upd.content[0].text, /#2 \[pending\]/);
+      const got = await run({ action: "get", id: "2" });
+      assert.match(got.content[0].text, /Review it/);
+      assert.match(got.content[0].text, /activeForm: Reviewing/);
+      assert.deepEqual(
+        got.details.tasks.map((t: any) => [t.id, t.status]),
+        [["1", "pending"], ["2", "pending"]],
+      );
+      assert.equal(got.details.nextId, 3);
+    });
+
+    it("list marks a task ready only when pending and all blockers are completed", async () => {
+      const { run } = setup();
+      await run({ action: "create", subject: "A" });
+      await run({ action: "create", subject: "B", blockedBy: ["1"] });
+      let list = await run({ action: "list" });
+      const lines = () => list.content[0].text.split("\n");
+      assert.match(lines()[0], /^#1 \[pending\] ready A/);
+      assert.doesNotMatch(lines()[1], /ready/);
+      await run({ action: "update", id: "1", status: "in_progress" });
+      list = await run({ action: "list" });
+      assert.doesNotMatch(lines()[0], /ready/);
+      assert.doesNotMatch(lines()[1], /ready/);
+      await run({ action: "update", id: "1", status: "completed" });
+      list = await run({ action: "list" });
+      assert.match(lines()[1], /^#2 \[pending\] ready B/);
+      await run({ action: "update", id: "1", status: "failed" });
+      list = await run({ action: "list" });
+      assert.doesNotMatch(lines()[1], /ready/);
+    });
+
+    it("rejects unknown ids, unknown blockers, bad status and cycles", async () => {
+      const { run } = setup();
+      await run({ action: "create", subject: "A" });
+      await run({ action: "create", subject: "B", blockedBy: ["1"] });
+      await run({ action: "create", subject: "C", blockedBy: ["2"] });
+
+      assert.match((await run({ action: "get", id: "9" })).details.error, /Unknown task id "9"/);
+      assert.match((await run({ action: "update", id: "9", status: "completed" })).details.error, /Unknown task id/);
+      assert.match((await run({ action: "create", subject: "D", blockedBy: ["7"] })).details.error, /Unknown blocker "7"/);
+      assert.match((await run({ action: "update", id: "1", addBlockedBy: ["8"] })).details.error, /Unknown blocker/);
+      assert.match((await run({ action: "update", id: "1", status: "done" })).details.error, /Unknown status/);
+      assert.match((await run({ action: "create" })).details.error, /subject is required/);
+      // cycles: direct, transitive, self
+      assert.match((await run({ action: "update", id: "1", addBlockedBy: ["2"] })).details.error, /cycle/);
+      assert.match((await run({ action: "update", id: "1", addBlockedBy: ["3"] })).details.error, /cycle/);
+      assert.match((await run({ action: "update", id: "1", addBlockedBy: ["1"] })).details.error, /cycle/);
+      // a rejected update changes nothing
+      const list = await run({ action: "list" });
+      assert.deepEqual(list.details.tasks[0].blockedBy, []);
+      assert.equal(list.details.tasks.length, 3);
+      // removeBlockedBy works and then the edge is allowed
+      await run({ action: "update", id: "2", removeBlockedBy: ["1"] });
+      assert.equal((await run({ action: "update", id: "1", addBlockedBy: ["2"] })).details.error, undefined);
+    });
+  });
+
+  describe("registration", () => {
+    it("registers task and /tasks in the parent, next to subagent", () => {
+      const { tools, commands } = setup();
+      assert.ok(tools.some((t) => t.name === "subagent"));
+      assert.ok(tools.some((t) => t.name === "task"));
+      assert.ok(commands.tasks);
+    });
+
+    it("does not register task in a child (PI_SUBAGENT_ID set)", () => {
+      process.env.PI_SUBAGENT_ID = "abc12345";
+      const { tools, commands } = setup();
+      assert.equal(tools.some((t) => t.name === "task"), false);
+      assert.equal(commands.tasks, undefined);
+      assert.equal((subagentsModule as any).__test__.getTaskController(), null);
+    });
+
+    it("does not register task where subagent is denied", () => {
+      process.env.PI_DENY_TOOLS = "subagent";
+      const { tools } = setup();
+      assert.equal(tools.some((t) => t.name === "task"), false);
+    });
+
+    it("keeps the task tool definition small (350 tokens, about 1400 chars)", () => {
+      const { tool } = setup();
+      const size = JSON.stringify({ name: tool.name, description: tool.description, parameters: tool.parameters }).length;
+      assert.ok(size <= 1400, `task definition is ${size} chars`);
+      assert.match(JSON.stringify(setup().tools.find((t) => t.name === "subagent").parameters), /taskId/);
+    });
+  });
+
+  describe("spawn with taskId", () => {
+    it("rejects an unknown task id and a task that is not pending, before any launch", async () => {
+      const { tools, run } = setup();
+      const subagent = tools.find((t) => t.name === "subagent");
+      const spawn = (taskId: string) =>
+        subagent.execute("id", { name: "W", task: "do", taskId }, undefined, undefined, {
+          sessionManager: { getSessionFile: () => "/nonexistent/s.jsonl" },
+        });
+      const unknown = await spawn("5");
+      assert.match(unknown.content[0].text, /Unknown task id "5"/);
+
+      await run({ action: "create", subject: "A" });
+      await run({ action: "update", id: "1", status: "in_progress" });
+      const busy = await spawn("1");
+      assert.match(busy.content[0].text, /Task #1 is in_progress, not pending/);
+      await run({ action: "update", id: "1", status: "completed" });
+      assert.match((await spawn("#1")).content[0].text, /is completed, not pending/);
+      assert.equal(labelCalls().some((c) => c.args.includes("pi.taskid=1")), false);
+    });
+
+    it("claim sets in_progress and the owner, and refuses a second claim", () => {
+      setup();
+      const controller = (subagentsModule as any).__test__.getTaskController();
+      controller.run({ action: "create", subject: "A" });
+      const task = controller.claim("1", "Worker");
+      assert.equal(task.status, "in_progress");
+      assert.equal(task.owner, "Worker");
+      assert.throws(() => controller.claim("1", "Other"), /in_progress, not pending/);
+      assert.throws(() => controller.claim("4", "Other"), /Unknown task id/);
+      controller.release("1");
+      assert.equal(controller.store.get("1").status, "pending");
+      assert.equal(controller.store.get("1").owner, undefined);
+    });
+  });
+
+  describe("automatic changes", () => {
+    const api = () => (subagentsModule as any).__test__;
+    const running = (over: Record<string, unknown> = {}) => ({ id: "ab12", name: "Worker", taskId: "1", ...over });
+    const result = (over: Record<string, unknown> = {}) => ({ name: "Worker", task: "", summary: "ok", exitCode: 0, elapsed: 1, ...over });
+
+    function started() {
+      const ctxs = setup();
+      const controller = api().getTaskController();
+      controller.run({ action: "create", subject: "A" });
+      controller.claim("1", "Worker (ab12)");
+      return { ...ctxs, controller };
+    }
+    const statusOf = (c: any) => c.store.get("1").status;
+
+    it("a child result completes the task", () => {
+      const { controller } = started();
+      api().settleTaskForResult(running(), result());
+      assert.equal(statusOf(controller), "completed");
+    });
+
+    it("an error, a non-zero exit or no result fails the task", () => {
+      for (const over of [{ errorMessage: "boom" }, { exitCode: 2 }, { noResult: true }, { error: "x" }]) {
+        const { controller } = started();
+        api().settleTaskForResult(running(), result(over));
+        assert.equal(statusOf(controller), "failed", JSON.stringify(over));
+      }
+    });
+
+    it("a stopped child cancels the task", () => {
+      const { controller } = started();
+      api().settleTaskForResult(running({ stopped: true }), result());
+      assert.equal(statusOf(controller), "cancelled");
+    });
+
+    it("subagent_control stop marks the child stopped; the following result cancels", () => {
+      const { controller } = started();
+      const dir = createTestDir();
+      try {
+        const map = api().runningSubagents as Map<string, any>;
+        map.clear();
+        const child: any = {
+          id: "ab12",
+          name: "Worker",
+          task: "",
+          taskId: "1",
+          surface: "t9",
+          startTime: 0,
+          sessionFile: join(dir, "w.jsonl"),
+          interactive: false,
+          statusState: createStatusState({ source: "pi", startTimeMs: 0 }),
+        };
+        map.set("ab12", child);
+        const out = api().handleSubagentStop({ name: "Worker" });
+        assert.equal(out.details.status, "stop_requested");
+        assert.equal(child.stopped, true);
+        api().settleTaskForResult(child, result());
+        assert.equal(statusOf(controller), "cancelled");
+        map.clear();
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("a ping or a parent-session cancel leaves the task in progress; a manual change is not overwritten", () => {
+      const { controller } = started();
+      api().settleTaskForResult(running(), result({ ping: { name: "W", message: "help" } }));
+      api().settleTaskForResult(running(), result({ error: "cancelled", exitCode: 1 }));
+      assert.equal(statusOf(controller), "in_progress");
+      controller.run({ action: "update", id: "1", status: "cancelled" });
+      api().settleTaskForResult(running(), result());
+      assert.equal(statusOf(controller), "cancelled");
+    });
+
+    it("a child without taskId touches nothing", () => {
+      const { controller, entries } = started();
+      const before = entries.length;
+      api().settleTaskForResult({ id: "x", name: "N" }, result());
+      assert.equal(statusOf(controller), "in_progress");
+      assert.equal(entries.length, before);
+    });
+
+    it("automatic changes are stored as task-snapshot custom entries", () => {
+      const { entries, controller } = started();
+      assert.equal(entries.at(-1)!.type, "task-snapshot");
+      api().settleTaskForResult(running(), result());
+      const last = entries.at(-1)!;
+      assert.equal(last.type, "task-snapshot");
+      assert.equal(last.data.tasks[0].status, "completed");
+      assert.equal(last.data.nextId, 2);
+      // tool calls do not add entries: the tool result carries the snapshot
+      const n = entries.length;
+      controller.run({ action: "create", subject: "B" });
+      assert.equal(entries.length, n);
+    });
+  });
+
+  describe("labels and widget", () => {
+    it("writes pi.tasks and pi.tasknow on the parent terminal after every change", async () => {
+      const { run } = setup();
+      await run({ action: "create", subject: "First" });
+      assert.deepEqual(labelCalls().at(-1)!.args, ["label", "t1", "pi.tasks=0/1", "pi.tasknow="]);
+      await run({ action: "create", subject: "Second" });
+      await run({ action: "update", id: "1", status: "in_progress" });
+      assert.deepEqual(lastLabel(), ["pi.tasks=0/2", "pi.tasknow=#1 First"]);
+      await run({ action: "update", id: "2", status: "in_progress" });
+      assert.deepEqual(lastLabel(), ["pi.tasks=0/2", "pi.tasknow=#1 First +1"]);
+      await run({ action: "update", id: "1", status: "completed" });
+      assert.deepEqual(lastLabel(), ["pi.tasks=1/2", "pi.tasknow=#2 Second"]);
+      // cancelled tasks do not count in the total
+      await run({ action: "update", id: "2", status: "cancelled" });
+      assert.deepEqual(lastLabel(), ["pi.tasks=1/1", "pi.tasknow="]);
+    });
+
+    it("does not rewrite labels that did not change", async () => {
+      const { run } = setup();
+      await run({ action: "create", subject: "A" });
+      const n = labelCalls().length;
+      await run({ action: "list" });
+      await run({ action: "update", id: "1", description: "more" });
+      assert.equal(labelCalls().length, n);
+    });
+
+    it("pi.tasknow skips tasks that have a child owner", () => {
+      setup();
+      const controller = (subagentsModule as any).__test__.getTaskController();
+      controller.run({ action: "create", subject: "A" });
+      controller.run({ action: "create", subject: "B" });
+      controller.claim("1", "Worker (ab12)");
+      controller.run({ action: "update", id: "2", status: "in_progress" });
+      assert.deepEqual(lastLabel(), ["pi.tasks=0/2", "pi.tasknow=#2 B"]);
+    });
+
+    it("a failing hc label does not break the tool, and is retried on the next change", async () => {
+      const { run } = setup();
+      let fail = true;
+      __setHcExec({
+        sync: (file, args) => {
+          calls.push({ file, args });
+          if (fail) throw new Error("hc down");
+          return "";
+        },
+        async: async () => "",
+      });
+      const out = await run({ action: "create", subject: "A" });
+      assert.equal(out.details.error, undefined);
+      assert.equal(out.details.tasks.length, 1);
+      fail = false;
+      await run({ action: "list" });
+      assert.deepEqual(lastLabel(), ["pi.tasks=0/1", "pi.tasknow="]);
+    });
+
+    it("no labels are written outside Herdr (no HC_TERMINAL_ID)", async () => {
+      delete process.env.HC_TERMINAL_ID;
+      const { run } = setup();
+      await run({ action: "create", subject: "A" });
+      assert.equal(labelCalls().length, 0);
+    });
+
+    it("widget: header, open tasks by in_progress, ready, blocked; none when empty", async () => {
+      const { run, widgets, ctx, handlers } = setup();
+      handlers.session_start({ reason: "startup" }, ctx);
+      assert.equal(widgets.at(-1), undefined);
+      await run({ action: "create", subject: "Blocker" });
+      await run({ action: "create", subject: "Waits", blockedBy: ["1"] });
+      await run({ action: "create", subject: "Free" });
+      await run({ action: "create", subject: "Doing" });
+      await run({ action: "update", id: "4", status: "in_progress", activeForm: "Doing it" });
+      await run({ action: "create", subject: "Done" });
+      await run({ action: "update", id: "5", status: "completed" });
+      assert.deepEqual(widgets.at(-1), [
+        "Tasks 1/5",
+        "▶ #4 Doing it",
+        "○ #1 Blocker",
+        "○ #3 Free",
+        "· #2 Waits (blocked by #1)",
+      ]);
+    });
+
+    it("widget never exceeds 6 lines", async () => {
+      const { run, widgets, handlers, ctx } = setup();
+      handlers.session_start({ reason: "startup" }, ctx);
+      for (let i = 1; i <= 9; i++) await run({ action: "create", subject: `T${i}` });
+      const lines = widgets.at(-1)!;
+      assert.equal(lines.length, 6);
+      assert.equal(lines[0], "Tasks 0/9");
+      assert.match(lines[5], /\+5 more/);
+    });
+
+    it("/tasks shows the full list", async () => {
+      const { run, commands, ctx, notes } = setup();
+      await run({ action: "create", subject: "A" });
+      await commands.tasks.handler("", ctx);
+      assert.match(notes[0], /#1 \[pending\] ready A/);
+    });
+  });
+
+  describe("rebuild from the session branch", () => {
+    const toolEntry = (tasks: any[], nextId: number) => ({
+      type: "message",
+      message: { role: "toolResult", toolName: "task", details: { action: "list", tasks, nextId } },
+    });
+    const snapEntry = (tasks: any[], nextId: number) => ({
+      type: "custom",
+      customType: "task-snapshot",
+      data: { tasks, nextId },
+    });
+    const task = (id: string, status: string, extra: any = {}) => ({ id, subject: `S${id}`, status, blockedBy: [], ...extra });
+
+    it("session_start and session_tree load the last snapshot on the branch", async () => {
+      const { handlers, ctx, state, run } = setup();
+      state.branch = [
+        { type: "message", message: { role: "user" } },
+        toolEntry([task("1", "pending")], 2),
+        snapEntry([task("1", "in_progress", { owner: "W (a)" })], 2),
+        { type: "message", message: { role: "toolResult", toolName: "other", details: { tasks: [] } } },
+      ];
+      handlers.session_start({ reason: "resume" }, ctx);
+      assert.equal((await run({ action: "get", id: "1" })).details.tasks[0].status, "in_progress");
+
+      // the last entry wins, whether it is a tool result or a custom entry
+      state.branch = [snapEntry([task("1", "in_progress")], 2), toolEntry([task("1", "completed"), task("2", "pending")], 3)];
+      handlers.session_tree({}, ctx);
+      const list = await run({ action: "list" });
+      assert.deepEqual(list.details.tasks.map((t: any) => t.status), ["completed", "pending"]);
+      assert.equal(list.details.nextId, 3);
+      const created = await run({ action: "create", subject: "next" });
+      assert.equal(created.details.taskId, "3");
+    });
+
+    it("a branch without snapshots gives an empty list; labels and widget follow", async () => {
+      const { handlers, ctx, state, run, widgets } = setup();
+      await run({ action: "create", subject: "A" });
+      state.branch = [];
+      handlers.session_tree({}, ctx);
+      assert.equal((await run({ action: "list" })).content[0].text, "No tasks.");
+      assert.equal(widgets.at(-1), undefined);
+      assert.deepEqual(lastLabel(), ["pi.tasks=", "pi.tasknow="]);
+    });
+
+    it("resume restores labels on the parent terminal", () => {
+      const { handlers, ctx, state } = setup();
+      state.branch = [snapEntry([task("1", "completed"), task("2", "in_progress")], 3)];
+      handlers.session_start({ reason: "resume" }, ctx);
+      assert.deepEqual(lastLabel(), ["pi.tasks=1/2", "pi.tasknow=#2 S2"]);
+    });
   });
 });

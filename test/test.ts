@@ -48,6 +48,12 @@ import {
   parseStatusConfig,
 } from "../pi-extension/subagents/status.ts";
 import {
+  appendInboxMessage,
+  createActivityLabelWriter,
+  createInboxConsumer,
+  formatToolActivity,
+} from "../pi-extension/subagents/steer.ts";
+import {
   createSubagentActivityRecorder,
   getSubagentActivityFile,
   readSubagentActivityFile,
@@ -1132,15 +1138,24 @@ describe("subagent discovery", () => {
       const { api, registeredTools } = createMockExtensionApi();
       (subagentsModule as any).default(api);
 
-      const tool = registeredTools.find((tool) => tool.name === "subagents_list");
-      assert.ok(tool, "expected subagents_list to be registered");
+      const tool = registeredTools.find((tool) => tool.name === "subagent_control");
+      assert.ok(tool, "expected subagent_control to be registered");
 
-      const result = await tool.execute();
+      const result = await tool.execute("id", { action: "list" });
       const agents = result.details?.agents ?? [];
 
       assert.ok(agents.some((agent: any) => agent.name === "visible-discovery-test-agent"));
       assert.match(result.content[0].text, /visible-discovery-test-agent/);
     });
+  });
+
+  it("list shows running subagents before agent definitions", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const lines = testApi.formatRunningSubagents(
+      [{ id: "ab12", name: "Scout", agent: "scout", startTime: 1_000, statusState: { phase: "active" } }],
+      1_000 + 75_000,
+    );
+    assert.deepEqual(lines, ['• ab12 "Scout" (scout) — active, 1m15s']);
   });
 
   it("hides disable-model-invocation agents from listings but keeps direct loading", async () => {
@@ -1160,10 +1175,10 @@ describe("subagent discovery", () => {
       const { api, registeredTools } = createMockExtensionApi();
       (subagentsModule as any).default(api);
 
-      const tool = registeredTools.find((tool) => tool.name === "subagents_list");
-      assert.ok(tool, "expected subagents_list to be registered");
+      const tool = registeredTools.find((tool) => tool.name === "subagent_control");
+      assert.ok(tool, "expected subagent_control to be registered");
 
-      const result = await tool.execute();
+      const result = await tool.execute("id", { action: "list" });
       const agents = result.details?.agents ?? [];
 
       assert.equal(agents.some((agent: any) => agent.name === "hidden-discovery-test-agent"), false);
@@ -1204,10 +1219,10 @@ describe("subagent discovery", () => {
       const { api, registeredTools } = createMockExtensionApi();
       (subagentsModule as any).default(api);
 
-      const tool = registeredTools.find((tool) => tool.name === "subagents_list");
-      assert.ok(tool, "expected subagents_list to be registered");
+      const tool = registeredTools.find((tool) => tool.name === "subagent_control");
+      assert.ok(tool, "expected subagent_control to be registered");
 
-      const result = await tool.execute();
+      const result = await tool.execute("id", { action: "list" });
       const agents = result.details?.agents ?? [];
 
       assert.equal(agents.some((agent: any) => agent.name === "shadowed-discovery-test-agent"), false);
@@ -1380,12 +1395,14 @@ describe("tool registration", () => {
     });
   });
 
-  it("expands spawning false to deny subagent interruption", () => {
+  it("expands spawning false to deny subagent control", () => {
     const testApi = (subagentsModule as any).__test__;
     const denied = testApi.resolveDenyTools({ spawning: false });
 
     assert.equal(denied.has("subagent"), true);
-    assert.equal(denied.has("subagent_interrupt"), true);
+    assert.equal(denied.has("subagent_control"), true);
+    assert.equal(denied.has("subagent_interrupt"), false);
+    assert.equal(denied.has("subagents_list"), false);
     assert.equal(denied.has("subagent_resume"), true);
   });
 
@@ -1610,12 +1627,113 @@ describe("subagent interruption", () => {
     };
   }
 
-  it("registers subagent_interrupt in the main session extension", () => {
-    const { api, registeredTools } = createMockExtensionApi();
+  it("registers subagent_control and drops the old interrupt/list tools", () => {
+    const { api, registeredTools, registeredCommands } = createMockExtensionApi();
 
     (subagentsModule as any).default(api);
 
-    assert.equal(registeredTools.some((tool) => tool.name === "subagent_interrupt"), true);
+    assert.equal(registeredTools.some((tool) => tool.name === "subagent_control"), true);
+    assert.equal(registeredTools.some((tool) => tool.name === "subagent_interrupt"), false);
+    assert.equal(registeredTools.some((tool) => tool.name === "subagents_list"), false);
+    assert.equal(registeredCommands.some((command) => command.name === "steer"), true);
+  });
+
+  describe("subagent_control steer / stop", () => {
+    function setup() {
+      const dir = createTestDir();
+      const inboxFile = join(dir, "inbox.jsonl");
+      const activityFile = join(dir, "activity.json");
+      const testApi = (subagentsModule as any).__test__;
+      const runningMap = testApi.runningSubagents as Map<string, any>;
+      runningMap.clear();
+      return { dir, inboxFile, activityFile, testApi, runningMap };
+    }
+
+    it("steer appends to the inbox and reports delivered once the child acks", async () => {
+      const { dir, inboxFile, activityFile, testApi, runningMap } = setup();
+      try {
+        runningMap.set("a1", makeRunning({ id: "a1", name: "Worker", inboxFile, activityFile }));
+        const recorder = createSubagentActivityRecorder({ runningChildId: "a1", activityFile });
+        recorder.sessionStart();
+        const pending = testApi.handleSubagentSteer({ name: "Worker", message: "go left" }, { ackTimeoutMs: 3000 });
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        recorder.inboxDelivered(1);
+        const result = await pending;
+
+        assert.equal(result.details.status, "steer_delivered");
+        assert.match(result.content[0].text, /delivered/);
+        assert.match(readFileSync(inboxFile, "utf8"), /"text":"go left"/);
+      } finally {
+        runningMap.clear();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("steer reports not confirmed when the child never acks", async () => {
+      const { dir, inboxFile, activityFile, testApi, runningMap } = setup();
+      try {
+        runningMap.set("a1", makeRunning({ id: "a1", name: "Worker", inboxFile, activityFile }));
+        const result = await testApi.handleSubagentSteer({ name: "Worker", message: "hi" }, { ackTimeoutMs: 300 });
+        assert.equal(result.details.status, "steer_unconfirmed");
+        assert.match(result.content[0].text, /not confirmed/);
+      } finally {
+        runningMap.clear();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("steer requires a message and rejects Claude-backed children", async () => {
+      const { dir, inboxFile, testApi, runningMap } = setup();
+      try {
+        runningMap.set("a1", makeRunning({ id: "a1", name: "Worker", inboxFile }));
+        runningMap.set("c1", makeRunning({ id: "c1", name: "Claude", cli: "claude" }));
+        assert.match((await testApi.handleSubagentSteer({ name: "Worker" })).content[0].text, /non-empty/);
+        assert.match((await testApi.handleSubagentSteer({ name: "Claude", message: "x" })).content[0].text, /unsupported/);
+        assert.match(testApi.handleSubagentStop({ name: "Claude" }).content[0].text, /unsupported/);
+      } finally {
+        runningMap.clear();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("interrupt with a message sends Escape first, then delivers", async () => {
+      const { dir, inboxFile, activityFile, testApi, runningMap } = setup();
+      try {
+        runningMap.set("a1", makeRunning({ id: "a1", name: "Worker", surface: "t9", inboxFile, activityFile }));
+        const order: string[] = [];
+        const result = await testApi.handleSubagentInterruptWithMessage(
+          { name: "Worker", message: "new plan" },
+          () => order.push("escape"),
+          { ackTimeoutMs: 200, settleMs: 0 },
+        );
+        order.push(readFileSync(inboxFile, "utf8").includes("new plan") ? "inbox" : "no-inbox");
+        assert.deepEqual(order, ["escape", "inbox"]);
+        assert.equal(result.details.status, "interrupt_requested");
+      } finally {
+        runningMap.clear();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("stop writes a done sidecar with the last assistant output", () => {
+      const { dir, testApi, runningMap } = setup();
+      try {
+        const sessionFile = join(dir, "s.jsonl");
+        writeFileSync(sessionFile, [
+          JSON.stringify({ type: "session", id: "x" }),
+          JSON.stringify({ type: "message", message: { role: "assistant", content: [{ type: "text", text: "partial work" }] } }),
+        ].join("\n") + "\n");
+        runningMap.set("a1", makeRunning({ id: "a1", name: "Worker", sessionFile }));
+        const result = testApi.handleSubagentStop({ name: "Worker" });
+        assert.equal(result.details.status, "stop_requested");
+        const sidecar = JSON.parse(readFileSync(`${sessionFile}.exit`, "utf8"));
+        assert.equal(sidecar.type, "done");
+        assert.match(sidecar.summary, /Stopped by parent/);
+      } finally {
+        runningMap.clear();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
   });
 
   it("resolves interrupt targets by exact id and reports name ambiguity", () => {
@@ -2455,5 +2573,137 @@ describe("model resolution settings", () => {
     assert.equal(resolveEffectiveModel(undefined, undefined, {}), undefined);
     assert.equal(resolveEffectiveModel("anthropic/claude-opus-4-6", undefined, {}), "anthropic/claude-opus-4-6");
     assert.equal(resolveEffectiveModel(undefined, "anthropic/claude-haiku-4-5", {}), "anthropic/claude-haiku-4-5");
+  });
+});
+
+describe("steer.ts", () => {
+  describe("formatToolActivity", () => {
+    it("formats bash, file tools and unknown tools on one line", () => {
+      assert.equal(formatToolActivity("bash", { command: "npm test" }), "bash: npm test");
+      assert.equal(formatToolActivity("read", { path: "/a/b/hc.ts" }), "read: hc.ts");
+      assert.equal(formatToolActivity("subagent_done", {}), "subagent_done");
+      assert.equal(formatToolActivity(undefined, undefined), "tool");
+      assert.equal(formatToolActivity("bash", { command: "echo a\n  b" }), "bash: echo a b");
+    });
+
+    it("truncates to 80 characters", () => {
+      const text = formatToolActivity("bash", { command: "x".repeat(300) });
+      assert.equal(text.length, 80);
+      assert.ok(text.endsWith("…"));
+    });
+  });
+
+  describe("createActivityLabelWriter", () => {
+    function makeWriter() {
+      let now = 10_000;
+      const writes: string[] = [];
+      const writer = createActivityLabelWriter({ run: (text) => { writes.push(text); }, now: () => now });
+      return { writer, writes, advance: (ms: number) => { now += ms; } };
+    }
+
+    it("writes the first value at once and skips unchanged text", () => {
+      const { writer, writes, advance } = makeWriter();
+      writer.set("thinking");
+      advance(5000);
+      writer.set("thinking");
+      assert.deepEqual(writes, ["thinking"]);
+    });
+
+    it("writes at most once per 2 s; the latest pending value goes out on flush", () => {
+      const { writer, writes, advance } = makeWriter();
+      writer.set("thinking");
+      advance(500);
+      writer.set("bash: a");
+      writer.set("bash: b");
+      assert.deepEqual(writes, ["thinking"]);
+      advance(1600);
+      writer.set("read: c");
+      assert.deepEqual(writes, ["thinking", "read: c"]);
+    });
+
+    it("flush sends the pending value and a throwing run never escapes", () => {
+      let now = 0;
+      const writer = createActivityLabelWriter({
+        run: () => { throw new Error("hc missing"); },
+        now: () => now,
+      });
+      assert.doesNotThrow(() => writer.set("a"));
+      now += 100;
+      writer.set("b");
+      assert.doesNotThrow(() => writer.flush());
+    });
+
+    it("collapses whitespace and ignores empty text", () => {
+      const { writer, writes } = makeWriter();
+      writer.set("   ");
+      writer.set("a\n  b");
+      assert.deepEqual(writes, ["a b"]);
+    });
+  });
+
+  describe("inbox", () => {
+    it("delivers each message once, in order, and acks", () => {
+      const dir = createTestDir();
+      try {
+        const file = join(dir, "sub", "inbox.jsonl");
+        const delivered: string[] = [];
+        const acked: number[] = [];
+        const consumer = createInboxConsumer({
+          inboxFile: file,
+          deliver: (m) => delivered.push(m.text),
+          onDelivered: (m) => acked.push(m.id),
+        });
+        consumer.poll(); // missing file is fine
+        assert.equal(appendInboxMessage(file, "one"), 1);
+        assert.equal(appendInboxMessage(file, "two\nlines"), 2);
+        consumer.poll();
+        consumer.poll();
+        assert.equal(appendInboxMessage(file, "three"), 3);
+        consumer.poll();
+        assert.deepEqual(delivered, ["one", "two\nlines", "three"]);
+        assert.deepEqual(acked, [1, 2, 3]);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("waits for a complete line and survives a failing deliver", () => {
+      const dir = createTestDir();
+      try {
+        const file = join(dir, "inbox.jsonl");
+        const delivered: number[] = [];
+        let fail = true;
+        const consumer = createInboxConsumer({
+          inboxFile: file,
+          deliver: (m) => {
+            if (fail && m.id === 1) throw new Error("boom");
+            delivered.push(m.id);
+          },
+        });
+        writeFileSync(file, '{"id":1,"text":"a","at":0}\n{"id":2,"te');
+        assert.doesNotThrow(() => consumer.poll());
+        fail = false;
+        writeFileSync(file, '{"id":1,"text":"a","at":0}\n{"id":2,"text":"b","at":0}\n');
+        consumer.poll();
+        assert.deepEqual(delivered, [2]);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  it("recorder stores inboxAck in the activity snapshot", () => {
+    const dir = createTestDir();
+    try {
+      const activityFile = join(dir, "a.json");
+      const recorder = createSubagentActivityRecorder({ runningChildId: "k1", activityFile });
+      recorder.sessionStart();
+      recorder.inboxDelivered(4);
+      const read = readSubagentActivityFile(activityFile, "k1");
+      assert.ok(read.ok);
+      assert.equal((read as any).activity.inboxAck, 4);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

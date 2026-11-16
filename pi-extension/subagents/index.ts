@@ -14,6 +14,7 @@ import {
   unlinkSync,
 } from "node:fs";
 import { homedir } from "node:os";
+import { appendInboxMessage, getSubagentInboxFile } from "./steer.ts";
 import { parseExtensionsField, resolveChildExtensions } from "./child-extensions.ts";
 import {
   isMuxAvailable,
@@ -170,8 +171,7 @@ interface ListedAgentDefinition extends AgentDefinition {
 /** Tools that are gated by `spawning: false` */
 const SPAWNING_TOOLS = new Set([
   "subagent",
-  "subagent_interrupt",
-  "subagents_list",
+  "subagent_control",
   "subagent_resume",
 ]);
 
@@ -505,6 +505,8 @@ interface RunningSubagent {
   sessionFile: string;
   launchScriptFile?: string;
   activityFile?: string;
+  /** Parent -> child steer messages (JSONL); Pi-backed children only. */
+  inboxFile?: string;
   activity?: SubagentActivityState;
   activityRead?: {
     ok: boolean;
@@ -843,6 +845,174 @@ function handleSubagentInterrupt(
   };
 }
 
+const STEER_ACK_TIMEOUT_MS = 5000;
+const STEER_ACK_POLL_MS = 250;
+/** Time for Escape to reach the child before a follow-up message is queued. */
+const INTERRUPT_SETTLE_MS = 500;
+
+function textResult(text: string, details: Record<string, unknown>) {
+  return { content: [{ type: "text" as const, text }], details };
+}
+
+/** Append a steer message to the child's inbox and wait for the child's ack. */
+async function deliverSteerMessage(
+  running: RunningSubagent,
+  message: string,
+  options: { ackTimeoutMs?: number } = {},
+): Promise<{ messageId: number; delivered: boolean }> {
+  if (!running.inboxFile) throw new Error(`Subagent "${running.name}" has no inbox.`);
+  const messageId = appendInboxMessage(running.inboxFile, message);
+  const deadline = Date.now() + (options.ackTimeoutMs ?? STEER_ACK_TIMEOUT_MS);
+  for (;;) {
+    observeRunningSubagent(running);
+    if ((running.activity?.inboxAck ?? 0) >= messageId) return { messageId, delivered: true };
+    if (Date.now() >= deadline) return { messageId, delivered: false };
+    await new Promise<void>((resolve) => setTimeout(resolve, STEER_ACK_POLL_MS));
+  }
+}
+
+function ackText(name: string, delivered: boolean, verb: string): string {
+  return delivered
+    ? `Message delivered to subagent "${name}" (${verb}).`
+    : `Message queued for subagent "${name}" (${verb}) but delivery not confirmed within ${STEER_ACK_TIMEOUT_MS / 1000}s; the child may be busy or not running its inbox watcher.`;
+}
+
+async function handleSubagentSteer(
+  params: { id?: string; name?: string; message?: string },
+  options: { ackTimeoutMs?: number } = {},
+) {
+  const resolved = resolveInterruptTarget(params);
+  if ("error" in resolved) return textResult(resolved.error, { error: resolved.error });
+  const running = resolved.running;
+  if (running.cli === "claude") {
+    return textResult("steer is supported only for Pi-backed subagents; Claude-backed subagents are unsupported.", {
+      error: "claude steer unsupported", id: running.id, name: running.name,
+    });
+  }
+  const message = params.message?.trim();
+  if (!message) return textResult("steer requires a non-empty `message`.", { error: "message required" });
+  try {
+    const { messageId, delivered } = await deliverSteerMessage(running, message, options);
+    return textResult(ackText(running.name, delivered, "steer"), {
+      id: running.id, name: running.name, status: delivered ? "steer_delivered" : "steer_unconfirmed", messageId,
+    });
+  } catch (error: any) {
+    const text = `Failed to steer subagent "${running.name}": ${error?.message ?? String(error)}`;
+    return textResult(text, { error: text, id: running.id, name: running.name });
+  }
+}
+
+async function handleSubagentInterruptWithMessage(
+  params: { id?: string; name?: string; message?: string },
+  sendEscapeKey: (surface: string) => void = sendEscape,
+  options: { ackTimeoutMs?: number; settleMs?: number } = {},
+) {
+  const interrupted = handleSubagentInterrupt(params, sendEscapeKey);
+  const message = params.message?.trim();
+  if (!message || (interrupted.details as any)?.status !== "interrupt_requested") return interrupted;
+
+  const running = runningSubagents.get((interrupted.details as any).id);
+  if (!running) return interrupted;
+  await new Promise<void>((resolve) => setTimeout(resolve, options.settleMs ?? INTERRUPT_SETTLE_MS));
+  try {
+    const { messageId, delivered } = await deliverSteerMessage(running, message, options);
+    return textResult(`Interrupt requested for subagent "${running.name}". ${ackText(running.name, delivered, "after interrupt")}`, {
+      id: running.id, name: running.name, status: "interrupt_requested", messageId, delivered,
+    });
+  } catch (error: any) {
+    const text = `Interrupt sent to "${running.name}" but message failed: ${error?.message ?? String(error)}`;
+    return textResult(text, { error: text, id: running.id, name: running.name });
+  }
+}
+
+/**
+ * End a running child and let the normal completion path (watchSubagent)
+ * report its partial result: the `.exit` sidecar carries the last assistant output.
+ */
+function handleSubagentStop(params: { id?: string; name?: string }) {
+  const resolved = resolveInterruptTarget(params);
+  if ("error" in resolved) return textResult(resolved.error, { error: resolved.error });
+  const running = resolved.running;
+  if (running.cli === "claude") {
+    return textResult("stop is supported only for Pi-backed subagents; Claude-backed subagents are unsupported.", {
+      error: "claude stop unsupported", id: running.id, name: running.name,
+    });
+  }
+  try {
+    const partial = existsSync(running.sessionFile)
+      ? findLastAssistantMessage(getNewEntries(running.sessionFile, 0))
+      : null;
+    const summary = partial
+      ? `Stopped by parent before completion. Last output:\n${partial}`
+      : "Stopped by parent before completion. No output recorded yet.";
+    writeFileSync(`${running.sessionFile}.exit`, JSON.stringify({ type: "done", summary }));
+  } catch (error: any) {
+    const text = `Failed to stop subagent "${running.name}": ${error?.message ?? String(error)}`;
+    return textResult(text, { error: text, id: running.id, name: running.name });
+  }
+  return textResult(
+    `Stop requested for subagent "${running.name}". Its partial result will be delivered as a normal completion.`,
+    { id: running.id, name: running.name, status: "stop_requested" },
+  );
+}
+
+function listAgentDefinitions() {
+  const list = discoverAgentDefinitions().filter((agent) => !agent.disableModelInvocation);
+  if (list.length === 0) {
+    return { content: [{ type: "text" as const, text: "No subagent definitions found." }], details: { agents: [] } };
+  }
+  const lines = list.map((a) => {
+    const badge = a.source === "project" ? " (project)" : "";
+    const desc = a.description ? ` — ${a.description}` : "";
+    const model = a.model ? ` [${a.model}]` : "";
+    return `• ${a.name}${badge}${model}${desc}`;
+  });
+  return { content: [{ type: "text" as const, text: lines.join("\n") }], details: { agents: list } };
+}
+
+/** Running children first (id, name, state, elapsed), then the agent definitions. */
+export function formatRunningSubagents(list: RunningSubagent[], now = Date.now()): string[] {
+  return list.map((running) => {
+    const secs = Math.max(0, Math.floor((now - running.startTime) / 1000));
+    const elapsed = secs < 60 ? `${secs}s` : `${Math.floor(secs / 60)}m${String(secs % 60).padStart(2, "0")}s`;
+    const state = running.statusState?.phase ?? "starting";
+    const agent = running.agent ? ` (${running.agent})` : "";
+    return `• ${running.id} "${running.name}"${agent} — ${state}, ${elapsed}`;
+  });
+}
+
+function listRunningAndDefinitions() {
+  const running = Array.from(runningSubagents.values());
+  const definitions = listAgentDefinitions();
+  const runningText = running.length
+    ? ["Running subagents:", ...formatRunningSubagents(running)].join("\n")
+    : "Running subagents: none.";
+  return {
+    content: [{ type: "text" as const, text: `${runningText}\n\nAgent definitions:\n${definitions.content[0].text}` }],
+    details: {
+      ...definitions.details,
+      running: running.map((r) => ({ id: r.id, name: r.name, agent: r.agent, phase: r.statusState?.phase ?? null, startTime: r.startTime })),
+    },
+  };
+}
+
+async function handleSubagentControl(
+  params: { id?: string; name?: string; action: "steer" | "interrupt" | "stop" | "list"; message?: string },
+) {
+  switch (params.action) {
+    case "steer":
+      return handleSubagentSteer(params);
+    case "interrupt":
+      return handleSubagentInterruptWithMessage(params);
+    case "stop":
+      return handleSubagentStop(params);
+    case "list":
+      return listRunningAndDefinitions();
+    default:
+      return textResult(`Unknown action "${String((params as any).action)}".`, { error: "unknown action" });
+  }
+}
+
 function startStatusRefresh(pi: ExtensionAPI) {
   if (!statusConfig.enabled || statusInterval) return;
 
@@ -902,6 +1072,7 @@ function resolveResumeLaunchBehavior(params: { autoExit?: boolean }): { autoExit
 }
 
 export const __test__ = {
+  formatRunningSubagents,
   getModuleAbortSignal,
   borderLine,
   getShellReadyDelayMs,
@@ -921,6 +1092,10 @@ export const __test__ = {
   resolveInterruptTarget,
   requestSubagentInterrupt,
   handleSubagentInterrupt,
+  handleSubagentSteer,
+  handleSubagentInterruptWithMessage,
+  handleSubagentStop,
+  handleSubagentControl,
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
   runningSubagents,
@@ -1000,6 +1175,7 @@ async function launchSubagent(
 
   const activityFile = getSubagentActivityFile(artifactDir, id);
   mkdirSync(dirname(activityFile), { recursive: true });
+  const inboxFile = getSubagentInboxFile(artifactDir, id);
   const { inheritsConversationContext } = launchBehavior;
 
   // Build the task message
@@ -1153,6 +1329,7 @@ async function launchSubagent(
   envParts.push(`PI_SUBAGENT_SESSION=${shellEscape(subagentSessionFile)}`);
   envParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
   envParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`);
+  envParts.push(`PI_SUBAGENT_INBOX_FILE=${shellEscape(inboxFile)}`);
   envParts.push(`PI_SUBAGENT_SURFACE=${shellEscape(surface)}`);
   const envPrefix = envParts.join(" ") + " ";
 
@@ -1219,6 +1396,7 @@ async function launchSubagent(
     sessionFile: subagentSessionFile,
     launchScriptFile,
     activityFile,
+    inboxFile,
     interactive: effectiveInteractive,
     statusState: createStatusState({
       source: "pi",
@@ -1637,28 +1815,34 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       },
     });
 
-  // ── subagent_interrupt tool ──
-  if (shouldRegister("subagent_interrupt"))
+  // ── subagent_control tool ──
+  if (shouldRegister("subagent_control"))
     pi.registerTool({
-      name: "subagent_interrupt",
-      label: "Interrupt Subagent",
-      description: "Send Escape to the active turn of a running Pi-backed subagent; its pane and session stay alive.",
+      name: "subagent_control",
+      label: "Control Subagent",
+      description:
+        "Control a running Pi-backed subagent: steer (queue a message it reads after its current tool call; starts a turn if idle), interrupt (Escape the current turn; optional message follows), stop (end it and return its partial result), list (running subagents with id, state and elapsed time, then the available agent definitions).",
       parameters: Type.Object({
         id: Type.Optional(Type.String({ description: "Exact running subagent id" })),
         name: Type.Optional(Type.String({ description: "Exact running subagent display name" })),
+        action: Type.Union(
+          [Type.Literal("steer"), Type.Literal("interrupt"), Type.Literal("stop"), Type.Literal("list")],
+          { description: "steer | interrupt | stop | list" },
+        ),
+        message: Type.Optional(Type.String({ description: "Text for steer (required) or interrupt (optional)" })),
       }),
 
       async execute(_toolCallId, params) {
-        return handleSubagentInterrupt(params);
+        return handleSubagentControl(params as any);
       },
 
       renderCall(args, theme) {
-        const target = args.id ? `${args.id}` : args.name ?? "(unknown)";
+        const target = args.id ? `${args.id}` : args.name ?? (args.action === "list" ? "agents" : "(unknown)");
         return new Text(
           theme.fg("accent", "▸") +
             " " +
             theme.fg("toolTitle", theme.bold(target)) +
-            theme.fg("dim", " — interrupt turn"),
+            theme.fg("dim", ` — ${args.action ?? "control"}`),
           0,
           0,
         );
@@ -1666,70 +1850,21 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
       renderResult(result, _opts, theme) {
         const details = result.details as any;
-        if (details?.status === "interrupt_requested") {
-          return new Text(
-            theme.fg("accent", "▸") +
-              " " +
-              theme.fg("toolTitle", theme.bold(details.name ?? details.id ?? "subagent")) +
-              theme.fg("dim", " — interrupt requested"),
-            0,
-            0,
-          );
+        const agents = details?.agents;
+        if (Array.isArray(agents)) {
+          if (agents.length === 0) return new Text(theme.fg("dim", "No subagent definitions found."), 0, 0);
+          const lines = agents.map((a: any) => {
+            const badge = a.source === "project" ? theme.fg("accent", " (project)") : "";
+            const desc = a.description ? theme.fg("dim", ` — ${a.description}`) : "";
+            const model = a.model ? theme.fg("dim", ` [${a.model}]`) : "";
+            return `  ${theme.fg("toolTitle", theme.bold(a.name))}${badge}${model}${desc}`;
+          });
+          return new Text(lines.join("\n"), 0, 0);
         }
-
         const text = typeof result.content[0]?.text === "string" ? result.content[0].text : "";
         return new Text(theme.fg("dim", text), 0, 0);
       },
     });
-
-  // ── subagents_list tool ──
-  if (shouldRegister("subagents_list"))
-    pi.registerTool({
-      name: "subagents_list",
-      label: "List Subagents",
-      description: "List available subagent definitions (project .pi/agents/ overrides global).",
-      parameters: Type.Object({}),
-
-      async execute() {
-        const list = discoverAgentDefinitions().filter((agent) => !agent.disableModelInvocation);
-
-        if (list.length === 0) {
-          return {
-            content: [{ type: "text", text: "No subagent definitions found." }],
-            details: { agents: [] },
-          };
-        }
-
-        const lines = list.map((a) => {
-          const badge = a.source === "project" ? " (project)" : "";
-          const desc = a.description ? ` — ${a.description}` : "";
-          const model = a.model ? ` [${a.model}]` : "";
-          return `• ${a.name}${badge}${model}${desc}`;
-        });
-
-        return {
-          content: [{ type: "text", text: lines.join("\n") }],
-          details: { agents: list },
-        };
-      },
-
-      renderResult(result, _opts, theme) {
-        const details = result.details as any;
-        const agents = details?.agents ?? [];
-        if (agents.length === 0) {
-          return new Text(theme.fg("dim", "No subagent definitions found."), 0, 0);
-        }
-        const lines = agents.map((a: any) => {
-          const badge = a.source === "project" ? theme.fg("accent", " (project)") : "";
-          const desc = a.description ? theme.fg("dim", ` — ${a.description}`) : "";
-          const model = a.model ? theme.fg("dim", ` [${a.model}]`) : "";
-          return `  ${theme.fg("toolTitle", theme.bold(a.name))}${badge}${model}${desc}`;
-        });
-        return new Text(lines.join("\n"), 0, 0);
-      },
-    });
-
-
 
   // ── subagent_resume tool ──
   if (shouldRegister("subagent_resume"))
@@ -1820,6 +1955,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
         const activityFile = getSubagentActivityFile(artifactDir, id);
         mkdirSync(dirname(activityFile), { recursive: true });
+        const inboxFile = getSubagentInboxFile(artifactDir, id);
 
         let resumeMsgFile: string | undefined;
         if (params.message) {
@@ -1848,6 +1984,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         resumeEnvParts.push(`PI_SUBAGENT_SESSION=${shellEscape(params.sessionPath)}`);
         resumeEnvParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
         resumeEnvParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`);
+        resumeEnvParts.push(`PI_SUBAGENT_INBOX_FILE=${shellEscape(inboxFile)}`);
         if (autoExit) {
           resumeEnvParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
         }
@@ -1885,6 +2022,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           sessionFile: params.sessionPath,
           launchScriptFile,
           activityFile,
+          inboxFile,
           interactive,
           statusState: createStatusState({
             source: "pi",
@@ -1985,6 +2123,28 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         ? `Use subagent to fork a session. fork: true, name: "Iterate", task: ${JSON.stringify(task)}`
         : `Use subagent to fork a session. fork: true, name: "Iterate", task: "The user wants to do some hands-on work. Help them with whatever they need."`;
       pi.sendUserMessage(toolCall);
+    },
+  });
+
+  // /steer command — send a message to a running subagent
+  pi.registerCommand("steer", {
+    description: "Steer a running subagent: /steer <name> <text>",
+    handler: async (args, ctx) => {
+      const trimmed = args.trim();
+      // Names may contain spaces: prefer the longest running name that prefixes the text.
+      const prefix = Array.from(runningSubagents.values())
+        .map((running) => running.name)
+        .filter((name) => trimmed.startsWith(`${name} `))
+        .sort((a, b) => b.length - a.length)[0];
+      const space = trimmed.search(/\s/);
+      if (!prefix && space < 0) {
+        ctx.ui.notify("Usage: /steer <name> <text>", "warning");
+        return;
+      }
+      const targetName = prefix ?? trimmed.slice(0, space);
+      const result = await handleSubagentSteer({ name: targetName, message: trimmed.slice(targetName.length + 1) });
+      const failed = (result.details as any)?.error || (result.details as any)?.status === "steer_unconfirmed";
+      ctx.ui.notify(result.content[0].text, failed ? "warning" : "info");
     },
   });
 

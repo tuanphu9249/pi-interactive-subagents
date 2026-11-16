@@ -6,8 +6,23 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
+import { execFile } from "node:child_process";
 import { writeFileSync } from "node:fs";
 import { createSubagentActivityRecorder } from "./activity.ts";
+import { createActivityLabelWriter, createInboxConsumer, formatToolActivity } from "./steer.ts";
+
+const INBOX_POLL_INTERVAL_MS = 1000;
+
+/** Run `hc label <terminal> pi.activity=<text>` without blocking the event loop. */
+function runActivityLabel(terminalId: string, text: string): Promise<void> {
+  return new Promise((resolve) => {
+    try {
+      execFile("hc", ["label", terminalId, `pi.activity=${text}`], { timeout: 5000 }, () => resolve());
+    } catch {
+      resolve();
+    }
+  });
+}
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
   return agentStarted;
@@ -90,6 +105,13 @@ export default function (pi: ExtensionAPI) {
     activityFile: process.env.PI_SUBAGENT_ACTIVITY_FILE,
   });
 
+  const terminalId = process.env.HC_TERMINAL_ID?.trim();
+  const activityLabel = terminalId
+    ? createActivityLabelWriter({ run: (text) => runActivityLabel(terminalId, text) })
+    : null;
+  const inboxFile = process.env.PI_SUBAGENT_INBOX_FILE?.trim();
+  let inboxTimer: ReturnType<typeof setInterval> | null = null;
+
   function renderWidget(ctx: { ui: { setWidget: Function } }, _theme: any) {
     ctx.ui.setWidget(
       "subagent-tools",
@@ -147,6 +169,16 @@ export default function (pi: ExtensionAPI) {
   // Show widget + status bar on session start
   pi.on("session_start", (_event, ctx) => {
     recorder.sessionStart();
+    activityLabel?.set("starting");
+    if (inboxFile && !inboxTimer) {
+      const inbox = createInboxConsumer({
+        inboxFile,
+        deliver: (message) => pi.sendUserMessage(message.text, { deliverAs: "steer" }),
+        onDelivered: (message) => recorder.inboxDelivered(message.id),
+      });
+      inboxTimer = setInterval(() => inbox.poll(), INBOX_POLL_INTERVAL_MS);
+      inboxTimer.unref?.();
+    }
     const tools = pi.getAllTools();
     toolNames = tools.map((t) => t.name).sort();
     denied = parseDeniedTools(deniedToolsValue);
@@ -164,6 +196,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("before_agent_start", () => {
     recorder.beforeAgentStart();
+    activityLabel?.set("thinking");
   });
 
   pi.on("agent_start", () => {
@@ -174,6 +207,8 @@ export default function (pi: ExtensionAPI) {
   pi.on("agent_end", (event, ctx) => {
     const messages = (event as any).messages as any[] | undefined;
     const shouldExit = autoExit && shouldAutoExitOnAgentEnd(userTookOver, messages);
+    if (shouldExit) activityLabel?.set("done");
+    else activityLabel?.set("waiting");
 
     if (shouldExit) {
       // Surface stopReason: "error" turns (auto-retry exhausted, provider
@@ -234,6 +269,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("tool_execution_start", (event) => {
     recorder.toolExecutionStart((event as any).toolCallId, (event as any).toolName);
+    activityLabel?.set(formatToolActivity((event as any).toolName, (event as any).args));
   });
 
   pi.on("tool_call", (event) => {
@@ -250,9 +286,13 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("tool_execution_end", (event) => {
     recorder.toolExecutionEnd((event as any).toolCallId, (event as any).toolName);
+    activityLabel?.set("thinking");
   });
 
   pi.on("session_shutdown", (event) => {
+    if (inboxTimer) clearInterval(inboxTimer);
+    inboxTimer = null;
+    activityLabel?.flush();
     recorder.sessionShutdown((event as any).reason);
   });
 

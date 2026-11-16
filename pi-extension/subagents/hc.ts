@@ -368,6 +368,7 @@ function applyLabels(terminalId: string, name: string, meta?: SurfaceMeta): void
     `pi.name=${name.replace(/\s+/g, " ").trim()}`,
     `pi.parent=${process.env.HC_TERMINAL_ID ?? ""}`,
     `pi.task=${task}`,
+    `pi.started=${Date.now()}`,
   ]);
 }
 

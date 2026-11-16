@@ -21,6 +21,7 @@ export type SubagentActivityEvent =
   | "tool_result"
   | "tool_execution_end"
   | "caller_ping"
+  | "inbox_delivered"
   | "subagent_done"
   | "session_shutdown";
 
@@ -45,6 +46,8 @@ export interface SubagentActivityState {
   toolName?: string;
   toolStartedAt?: number;
   toolEndedAt?: number;
+  /** Id of the last parent steer message delivered to this session. */
+  inboxAck?: number;
 }
 
 export type ActivityReadResult =
@@ -71,6 +74,7 @@ export interface SubagentActivityRecorder {
   toolResult(toolCallId?: string, toolName?: string): void;
   toolExecutionEnd(toolCallId?: string, toolName?: string): void;
   callerPing(): void;
+  inboxDelivered(messageId: number): void;
   subagentDone(): void;
   sessionShutdown(reason: SubagentShutdownReason): void;
 }
@@ -96,6 +100,7 @@ const KNOWN_EVENTS = new Set<SubagentActivityEvent>([
   "tool_result",
   "tool_execution_end",
   "caller_ping",
+  "inbox_delivered",
   "subagent_done",
   "session_shutdown",
 ]);
@@ -176,6 +181,7 @@ function validateActivity(value: unknown, expectedRunningChildId: string): Activ
     validateOptionalInteger(object, "turnIndex"),
     validateOptionalFiniteNumber(object, "toolStartedAt"),
     validateOptionalFiniteNumber(object, "toolEndedAt"),
+    validateOptionalInteger(object, "inboxAck"),
     validateOptionalActivityString(object, "messageEventType"),
     validateOptionalActivityString(object, "toolCallId"),
     validateOptionalActivityString(object, "toolName"),
@@ -240,6 +246,7 @@ function createNoopRecorder(): SubagentActivityRecorder {
     toolResult() {},
     toolExecutionEnd() {},
     callerPing() {},
+    inboxDelivered() {},
     subagentDone() {},
     sessionShutdown() {},
   };
@@ -499,6 +506,11 @@ export function createSubagentActivityRecorder(params: {
     },
     callerPing() {
       markDone("caller_ping");
+    },
+    inboxDelivered(messageId) {
+      record("inbox_delivered", (current) => {
+        current.inboxAck = messageId;
+      }, "immediate");
     },
     subagentDone() {
       markDone("subagent_done");

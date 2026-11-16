@@ -42,7 +42,7 @@ Herdr moves focus to a new split pane; the extension returns focus to the parent
 { "hc-subagents": { "layout": "split", "maxSplitChildren": 4 } }
 ```
 
-Change the layout for the rest of the session with `/subagents layout split|tab` (no argument shows the current layout). Each child terminal gets `hc` labels: `pi.subagent`, `pi.role`, `pi.name`, `pi.parent`, `pi.task`.
+Change the layout for the rest of the session with `/subagents layout split|tab` (no argument shows the current layout). Each child terminal gets `hc` labels: `pi.subagent`, `pi.role`, `pi.name`, `pi.parent`, `pi.task`, `pi.started`, `pi.activity` (see [Terminal labels](#terminal-labels)).
 
 If your shell startup is slow and subagent commands sometimes get dropped before the prompt is ready, set `PI_SUBAGENT_SHELL_READY_DELAY_MS` to a higher value (defaults to `500`):
 
@@ -56,13 +56,12 @@ Child panes start a clean bash and get the launch command by `hc send`. Note: th
 
 ### Extensions
 
-**Subagents** — 4 main-session tools + 3 commands, plus 1 subagent-only tool:
+**Subagents** — 3 main-session tools + 4 commands, plus 1 subagent-only tool:
 
 | Tool                 | Description                                                                                 |
 | -------------------- | ------------------------------------------------------------------------------------------- |
 | `subagent`           | Spawn a sub-agent in a dedicated multiplexer pane (async — returns immediately)             |
-| `subagent_interrupt` | Interrupt a running Pi-backed subagent's current turn                                       |
-| `subagents_list`     | List available agent definitions                                                            |
+| `subagent_control`   | Steer, interrupt or stop a running Pi-backed subagent, or list running subagents and agent definitions |
 | `subagent_resume`    | Resume a previous sub-agent session (async)                                                 |
 
 | Command                    | Description                          |
@@ -70,6 +69,7 @@ Child panes start a clean bash and get the launch command by `hc send`. Note: th
 | `/plan`                    | Start a full planning workflow       |
 | `/iterate`                 | Fork into a subagent for quick fixes |
 | `/subagent <agent> <task>` | Spawn a named agent directly         |
+| `/steer <name> <text>`     | Send a message to a running subagent |
 
 ### Bundled Agents
 
@@ -174,21 +174,38 @@ subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer"
 
 ---
 
-## Interrupting a running subagent
+## Controlling a running subagent
 
-Use `subagent_interrupt` to cancel the active turn of a running Pi-backed subagent:
+`subagent_control` takes `id` or `name` (exact), an `action`, and an optional `message`:
 
 ```typescript
-subagent_interrupt({ id: "abcd1234" });
-// or
-subagent_interrupt({ name: "Scout" });
+subagent_control({ name: "Scout", action: "steer", message: "Skip tests, focus on src/" });
+subagent_control({ name: "Scout", action: "interrupt" });
+subagent_control({ name: "Scout", action: "interrupt", message: "Stop that. Do X instead." });
+subagent_control({ name: "Scout", action: "stop" });
+subagent_control({ action: "list" });
 ```
 
-This sends Escape to the child pane, cancelling the in-progress model turn. The subagent session stays alive — the pane, session file, and background polling all remain intact. After the interrupt, the widget immediately moves the child back to `waiting`, and stale pre-interrupt snapshots are ignored. If the child starts work later, newer snapshots return it to `active`; completion, failure, and `caller_ping` still flow through normally.
+| Action      | Effect                                                                                                                                                                       |
+| ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `steer`     | Queue `message` for the child. It reads it after its current tool call (Pi `deliverAs: "steer"`); an idle child starts a new turn. Delivered once, in order.                 |
+| `interrupt` | Send Escape to the child pane, cancelling the in-progress turn. The pane, session file and polling stay alive. With `message`: Escape first, then the message as in `steer`. |
+| `stop`      | End the child and return its partial result (its last assistant output) through the normal completion path.                                                                  |
+| `list`      | List running subagents (id, name, state, elapsed), then available agent definitions (project `.pi/agents/` overrides global).                                                                                                  |
 
-This is a turn-level interrupt, not a method for forcibly terminating a subagent session.
+`steer` works through an inbox file (`PI_SUBAGENT_INBOX_FILE`, in the session artifacts next to the activity file). The parent appends a message; the child extension polls the file about once a second and records the last delivered message id in its activity snapshot. The tool waits up to about 5 seconds for that ack and reports `delivered` or `not confirmed`.
 
-> **Note:** Only Pi-backed subagents are supported. Claude-backed runs will return an error.
+The user can steer from the parent session with `/steer <name> <text>`.
+
+After an interrupt, the widget immediately moves the child back to `waiting`, and stale pre-interrupt snapshots are ignored. Interrupt is a turn-level cancel, not a way to end a session; use `stop` for that.
+
+> **Note:** Only Pi-backed subagents are supported. Claude-backed runs return an "unsupported" error.
+
+---
+
+## Terminal labels
+
+Each child terminal carries these `hc` labels: `pi.subagent`, `pi.role`, `pi.name`, `pi.parent`, `pi.task`, `pi.started` (spawn time, epoch ms) and `pi.activity` (current step, 80 characters max, e.g. `bash: npm test`, `thinking`, `waiting`). The child updates `pi.activity` itself, at most once per 2 seconds and only when the text changes.
 
 ---
 
@@ -288,7 +305,7 @@ You are a specialized agent that does X...
 | Field         | Type    | Description                                                                                                                                                                                                                                                                 |
 | ------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `name`        | string  | Agent name (used in `agent: "my-agent"`)                                                                                                                                                                                                                                    |
-| `description` | string  | Shown in `subagents_list` output                                                                                                                                                                                                                                            |
+| `description` | string  | Shown in `subagent_control({ action: "list" })` output                                                                                                                                                                                                                                            |
 | `model`       | string  | Default model (e.g. `anthropic/claude-sonnet-5-5`)                                                                                                                                                                                                                          |
 | `thinking`    | string  | Thinking level: `minimal`, `medium`, `high`                                                                                                                                                                                                                                 |
 | `tools`       | string  | Comma-separated **native pi tools only**: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`                                                                                                                                                                             |
@@ -299,11 +316,11 @@ You are a specialized agent that does X...
 | `auto-exit`   | boolean | Auto-shutdown when the agent finishes its turn — no `subagent_done` call needed. If the user sends any input, auto-exit is permanently disabled and the user takes over the session. Recommended for autonomous agents (scout, worker); not for interactive ones (planner). When unset, it follows `interactive`: autonomous spawns auto-exit. |
 | `interactive` | boolean | derived        | Override whether stall/recovery transitions wake the parent session. Defaults: interactive for `fork: true` or `auto-exit: false`, otherwise autonomous (stall pings on). Explicit values take precedence. |
 | `cwd`         | string  | Default working directory (absolute or relative to project root)                                                                                                                                                                                                            |
-| `disable-model-invocation` | boolean | Hide this agent from discovery surfaces like `subagents_list`. The agent still remains directly invokable by explicit name via `subagent({ agent: "name", ... })`. |
+| `disable-model-invocation` | boolean | Hide this agent from discovery surfaces like `subagent_control({ action: "list" })`. The agent still remains directly invokable by explicit name via `subagent({ agent: "name", ... })`. |
 
 ---
 
-Discovery still resolves precedence before visibility filtering. If a project-local hidden agent has the same name as a visible global or bundled agent, the hidden project agent wins and the lower-precedence agent does not appear in `subagents_list`.
+Discovery still resolves precedence before visibility filtering. If a project-local hidden agent has the same name as a visible global or bundled agent, the hidden project agent wins and the lower-precedence agent does not appear in `subagent_control({ action: "list" })`.
 
 ### `session-mode`
 
@@ -382,7 +399,7 @@ By default, every sub-agent can spawn further sub-agents. Control this with fron
 
 ### `spawning: false`
 
-Denies all subagent lifecycle tools (`subagent`, `subagent_interrupt`, `subagents_list`, `subagent_resume`):
+Denies all subagent lifecycle tools (`subagent`, `subagent_control`, `subagent_resume`):
 
 ```yaml
 ---
@@ -483,7 +500,7 @@ Every sub-agent session displays a compact tools widget showing available and de
 [scout] — 12 tools · 4 denied  (Ctrl+J)              ← collapsed
 [scout] — 12 available  (Ctrl+J to collapse)          ← expanded
   read, bash, edit, write, todo, ...
-  denied: subagent, subagents_list, ...
+  denied: subagent, subagent_control, ...
 ```
 
 ---

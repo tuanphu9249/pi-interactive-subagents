@@ -2316,7 +2316,7 @@ describe("hc.ts Herdr backend", () => {
     assert.equal(getMuxBackend(), null);
   });
 
-  it("splits right, then down on the last child, and refocuses the parent right after each split", () => {
+  it("splits right, then down on the last child, and refocuses the focused pane right after each split", () => {
     const a = createSurface("a");
     const b = createSurface("b");
     assert.deepEqual([a, b], ["t10", "t11"]);
@@ -2330,6 +2330,57 @@ describe("hc.ts Herdr backend", () => {
     // focus call is the very next CLI call after each split
     const idx = calls.findIndex((c) => c.args[1] === "pane.split");
     assert.equal(calls[idx + 1].args[1], "pane.focus");
+  });
+
+  describe("focus restore", () => {
+    const base = (statusImpl: () => string) => {
+      __setHcExec({
+        async: async () => "",
+        sync(file, args) {
+          calls.push({ file, args });
+          if (file === "herdr-app" && args[0] === "status") return statusImpl();
+          if (file === "herdr-app" && args[0] === "ls") return JSON.stringify(topology());
+          if (file === "herdr-app" && args[1] === "pane.split") {
+            const n = nextTerminal++;
+            extraTerminals.push({ terminal: `t${n}`, pane: `p${n}`, tab: "tabParent" });
+            return JSON.stringify({ pane: `p${n}`, terminal: `t${n}` });
+          }
+          return "";
+        },
+      });
+    };
+    const focusCalls = () => doCalls().filter((c) => c.args[1] === "pane.focus");
+
+    it("returns focus to the user's pane in another workspace", () => {
+      base(() => JSON.stringify({ space: "spOther", focused_pane: "pUser" }));
+      createSurface("a");
+      assert.deepEqual(focusCalls().map((c) => c.args.slice(1)), [["pane.focus", "--pane", "pUser"]]);
+      const statusIdx = calls.findIndex((c) => c.args[0] === "status");
+      const splitIdx = calls.findIndex((c) => c.args[1] === "pane.split");
+      assert.ok(statusIdx >= 0 && statusIdx < splitIdx);
+    });
+
+    it("does not run pane.focus when focused_pane is null or missing", () => {
+      base(() => JSON.stringify({ focused_pane: null }));
+      createSurface("a");
+      assert.equal(focusCalls().length, 0);
+      base(() => JSON.stringify({ space: "x" }));
+      createSurface("b");
+      assert.equal(focusCalls().length, 0);
+    });
+
+    it("falls back to the parent pane when status fails or does not parse", () => {
+      base(() => {
+        throw new Error("boom");
+      });
+      createSurface("a");
+      base(() => "not json");
+      createSurface("b");
+      assert.deepEqual(focusCalls().map((c) => c.args.slice(1)), [
+        ["pane.focus", "--pane", "pParent"],
+        ["pane.focus", "--pane", "pParent"],
+      ]);
+    });
   });
 
   it("overflows to the Subagents tab after maxSplitChildren live children", () => {

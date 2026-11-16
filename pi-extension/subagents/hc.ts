@@ -298,10 +298,30 @@ export function getSplitChildCount(): number {
   return splitChildren.length;
 }
 
+/**
+ * Pane to refocus after a split: the pane the user has focused (it may be in
+ * another workspace). Null when nothing is focused. Falls back to the parent
+ * pane when `herdr-app status` fails or its output does not parse.
+ */
+function readFocusTarget(parentPaneId: string): string | null {
+  let out: string;
+  try {
+    out = exec.sync("herdr-app", ["status"]);
+  } catch {
+    return parentPaneId;
+  }
+  const parsed = parseJson(out);
+  if (!parsed || typeof parsed !== "object") return parentPaneId;
+  const focused = parsed.focused_pane;
+  return typeof focused === "string" && focused ? focused : null;
+}
+
 function createSplitChild(parent: TerminalLocation): string {
   const last = splitChildren[splitChildren.length - 1];
   const anchorPane = last ? (panes.get(last) ?? parent.paneId) : parent.paneId;
   const direction = last ? "down" : "right";
+  // Remember what the user is looking at: the split moves focus to the new pane.
+  const focusTarget = readFocusTarget(parent.paneId);
   const out = herdrDo("pane.split", [
     "--direction",
     direction,
@@ -310,8 +330,8 @@ function createSplitChild(parent: TerminalLocation): string {
     "--argv",
     JSON.stringify(BASH_ARGV),
   ]);
-  // Split always moves focus to the new pane: restore it at once.
-  herdrDo("pane.focus", ["--pane", parent.paneId]);
+  // Restore focus at once. A null target means nothing was focused: skip.
+  if (focusTarget) herdrDo("pane.focus", ["--pane", focusTarget]);
   const parsed = parseJson(out);
   const paneId = extractId(parsed?.pane);
   const terminalId = extractId(parsed?.terminal);

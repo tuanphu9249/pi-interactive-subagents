@@ -36,7 +36,7 @@ Layout (new children only):
 - `split` (default): children stack in one column to the right of the parent pane. After `maxSplitChildren` (default 4) live children, new ones go to the tab.
 - `tab`: children go into one shared tab named "Subagents" in the parent's space.
 
-Herdr moves focus to a new split pane; the extension returns focus to the parent right after each split. Set defaults in `~/.pi/agent/settings.json` (or project `.pi/settings.json`):
+Herdr moves focus to a new split pane; the extension returns focus right after each split to the pane you had focused (read from `herdr-app status`, so it works across workspaces). If nothing was focused, it does not refocus. If status fails, it refocuses the parent pane. Set defaults in `~/.pi/agent/settings.json` (or project `.pi/settings.json`):
 
 ```json
 { "hc-subagents": { "layout": "split", "maxSplitChildren": 4 } }

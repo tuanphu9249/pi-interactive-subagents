@@ -217,24 +217,72 @@ export function formatTaskList(store: TaskStore): string {
   return tasks.map((t) => formatTaskLine(t, store.isReady(t))).join("\n");
 }
 
-/** Widget lines: `Tasks 3/7`, then open tasks (in_progress, ready, blocked). At most `maxLines` in all. */
-export function renderTaskWidgetLines(store: TaskStore, maxLines = 6): string[] | undefined {
-  const tasks = store.all();
-  if (tasks.length === 0) return undefined;
-  const { completed, total } = countTasks(tasks);
-  const lines = [`Tasks ${completed}/${total}`];
-  const inProgress = tasks.filter((t) => t.status === "in_progress");
-  const pending = tasks.filter((t) => t.status === "pending");
-  const ready = pending.filter((t) => store.isReady(t));
-  const blocked = pending.filter((t) => !store.isReady(t));
-  const open: string[] = [
-    ...inProgress.map((t) => `▶ #${t.id} ${t.activeForm || t.subject}${t.owner ? ` (${t.owner})` : ""}`),
-    ...ready.map((t) => `○ #${t.id} ${t.subject}`),
-    ...blocked.map((t) => `· #${t.id} ${t.subject} (blocked by ${t.blockedBy.map((b) => `#${b}`).join(",")})`),
-  ];
-  const room = maxLines - 1;
-  if (open.length <= room) return [...lines, ...open];
-  return [...lines, ...open.slice(0, room - 1), `… +${open.length - (room - 1)} more`];
+export interface TaskWidgetStyle {
+  /** Strike text through. Default: identity. */
+  strike?: (text: string) => string;
+  /** Dim a whole line (used for completed tasks). Default: identity. */
+  dim?: (text: string) => string;
+}
+
+/**
+ * Widget lines: `Tasks 3/7`, then tasks in id order (checklist):
+ * ✓ completed (struck, dim), ▶ in_progress, ○ ready, · blocked, ✗ failed. Cancelled tasks are hidden.
+ * At most `maxLines` in all. Open tasks (not completed) always win room. If room is short,
+ * the oldest completed tasks drop first and one `✓ N done` line replaces them.
+ * If open tasks alone overflow, show the first ones (in_progress, failed, ready, blocked) and `… +N more`.
+ */
+export function renderTaskWidgetLines(
+  store: TaskStore,
+  maxLines = 7,
+  style: TaskWidgetStyle = {},
+): string[] | undefined {
+  const strike = style.strike ?? ((t: string) => t);
+  const dim = style.dim ?? ((t: string) => t);
+  if (store.all().length === 0) return undefined;
+  const tasks = store.all().filter((t) => t.status !== "cancelled");
+  const { completed, total } = countTasks(store.all());
+  const header = `Tasks ${completed}/${total}`;
+  const room = Math.max(0, maxLines - 1);
+
+  const rowFor = (t: Task): string => {
+    switch (t.status) {
+      case "completed":
+        return dim(`✓ ${strike(`#${t.id} ${t.subject}`)}`);
+      case "in_progress":
+        return `▶ #${t.id} ${t.activeForm || t.subject}${t.owner ? ` (${t.owner})` : ""}`;
+      case "failed":
+        return `✗ #${t.id} ${t.subject}`;
+      default:
+        return store.isReady(t)
+          ? `○ #${t.id} ${t.subject}`
+          : `· #${t.id} ${t.subject} (blocked by ${t.blockedBy.map((b) => `#${b}`).join(",")})`;
+    }
+  };
+
+  const done = tasks.filter((t) => t.status === "completed");
+  const open = tasks.filter((t) => t.status !== "completed");
+
+  if (open.length > room) {
+    const rank = (t: Task) =>
+      t.status === "in_progress" ? 0 : t.status === "failed" ? 1 : store.isReady(t) ? 2 : 3;
+    const ordered = [...open].sort((a, b) => rank(a) - rank(b));
+    const shown = ordered.slice(0, Math.max(0, room - 1)).map(rowFor);
+    return [header, ...shown, `… +${open.length - shown.length} more`].slice(0, Math.max(1, maxLines));
+  }
+
+  const slots = room - open.length;
+  let dropped = 0;
+  let keep = done;
+  if (done.length > slots) {
+    const kept = Math.max(0, slots - 1);
+    dropped = done.length - kept;
+    keep = done.slice(done.length - kept);
+  }
+  const keepIds = new Set([...keep, ...open].map((t) => t.id));
+  const rows = tasks.filter((t) => keepIds.has(t.id)).map(rowFor);
+  // No free row (open tasks fill the room): drop the `✓ N done` line too; the header still counts them.
+  const doneLine = dropped > 0 && slots > 0 ? [dim(`✓ ${dropped} done`)] : [];
+  return [header, ...doneLine, ...rows];
 }
 
 /** Labels for the parent terminal. Empty string means: remove the label. */
@@ -285,7 +333,7 @@ export interface TaskControllerDeps {
   /** Persist a snapshot as a session custom entry. */
   appendEntry?: (customType: string, data: unknown) => void;
   /** Set or clear (undefined) the widget above the editor. */
-  setWidget?: (lines: string[] | undefined) => void;
+  setWidget?: (render: ((style: TaskWidgetStyle) => string[]) | undefined) => void;
   /** Write labels on a terminal. Empty value removes the label. May throw. */
   writeLabels?: (terminalId: string, labels: Record<string, string>) => void;
   /** Parent terminal id (`$HC_TERMINAL_ID`). */
@@ -322,7 +370,10 @@ export class TaskController {
   /** Update widget and parent labels. Never throws. */
   refresh(): void {
     try {
-      this.deps.setWidget?.(renderTaskWidgetLines(this.store));
+      const has = this.store.all().length > 0;
+      this.deps.setWidget?.(
+        has ? (style) => renderTaskWidgetLines(this.store, 7, style) ?? [] : undefined,
+      );
     } catch {}
     this.writeParentLabels();
   }

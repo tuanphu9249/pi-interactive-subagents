@@ -64,7 +64,7 @@ import {
   findLatestAssistantError,
 } from "../pi-extension/subagents/subagent-done.ts";
 import { __pollForExitTest__ } from "../pi-extension/subagents/hc.ts";
-import { shouldRemindAboutTasks } from "../pi-extension/subagents/tasks.ts";
+import { shouldRemindAboutTasks, renderTaskWidgetLines, TaskStore } from "../pi-extension/subagents/tasks.ts";
 
 // --- Helpers ---
 
@@ -2855,7 +2855,15 @@ describe("task tool", () => {
     const state = { branch };
     const ctx: any = {
       hasUI: true,
-      ui: { setWidget: (_k: string, lines: string[] | undefined) => widgets.push(lines), notify: (m: string) => notes.push(m) },
+      ui: {
+        setWidget: (_k: string, c: any) =>
+          widgets.push(
+            typeof c === "function"
+              ? c({}, { strikethrough: (t: string) => `~${t}~`, fg: (_n: string, t: string) => t })
+                  .render(80)
+                  .map((l: string) => l.replace(/^ /, "")) // the 1-column widget padding
+              : c,
+          ), notify: (m: string) => notes.push(m) },
       sessionManager: { getBranch: () => state.branch },
     };
     (subagentsModule as any).default(pi);
@@ -3152,7 +3160,7 @@ describe("task tool", () => {
       assert.equal(labelCalls().length, 0);
     });
 
-    it("widget: header, open tasks by in_progress, ready, blocked; none when empty", async () => {
+    it("widget: checklist in id order incl. struck completed; none when empty", async () => {
       const { run, widgets, ctx, handlers } = setup();
       handlers.session_start({ reason: "startup" }, ctx);
       assert.equal(widgets.at(-1), undefined);
@@ -3165,21 +3173,79 @@ describe("task tool", () => {
       await run({ action: "update", id: "5", status: "completed" });
       assert.deepEqual(widgets.at(-1), [
         "Tasks 1/5",
-        "▶ #4 Doing it",
         "○ #1 Blocker",
-        "○ #3 Free",
         "· #2 Waits (blocked by #1)",
+        "○ #3 Free",
+        "▶ #4 Doing it",
+        "✓ ~#5 Done~",
       ]);
     });
 
-    it("widget never exceeds 6 lines", async () => {
+    it("widget never exceeds 7 lines", async () => {
       const { run, widgets, handlers, ctx } = setup();
       handlers.session_start({ reason: "startup" }, ctx);
       for (let i = 1; i <= 9; i++) await run({ action: "create", subject: `T${i}` });
       const lines = widgets.at(-1)!;
-      assert.equal(lines.length, 6);
+      assert.equal(lines.length, 7);
       assert.equal(lines[0], "Tasks 0/9");
-      assert.match(lines[5], /\+5 more/);
+      assert.match(lines[6], /\+4 more/);
+    });
+
+    describe("renderTaskWidgetLines", () => {
+      const build = (specs: Array<[string, string?, string[]?]>) => {
+        const store = new TaskStore();
+        for (const [subject, status, blockedBy] of specs) {
+          const t = store.create({ subject, blockedBy });
+          if (status) store.update({ id: t.id, status });
+        }
+        return store;
+      };
+      const style = { strike: (t: string) => `~${t}~` };
+
+      it("3 done, 1 doing, 2 ready, 1 blocked: drops oldest done into one line when short", () => {
+        const store = build([
+          ["a", "completed"], ["b", "completed"], ["c", "completed"],
+          ["d", "in_progress"], ["e"], ["f"], ["g", undefined, ["5"]],
+        ]);
+        assert.deepEqual(renderTaskWidgetLines(store, 8, style), [
+          "Tasks 3/7",
+          "✓ ~#1 a~", "✓ ~#2 b~", "✓ ~#3 c~",
+          "▶ #4 d", "○ #5 e", "○ #6 f", "· #7 g (blocked by #5)",
+        ]);
+        assert.deepEqual(renderTaskWidgetLines(store, 6, style), [
+          "Tasks 3/7", "✓ 3 done", "▶ #4 d", "○ #5 e", "○ #6 f", "· #7 g (blocked by #5)",
+        ]);
+        assert.deepEqual(renderTaskWidgetLines(store, 7, style), [
+          "Tasks 3/7", "✓ 2 done", "✓ ~#3 c~", "▶ #4 d", "○ #5 e", "○ #6 f", "· #7 g (blocked by #5)",
+        ]);
+      });
+
+      it("failed shows ✗ unstruck; cancelled hidden; open overflow keeps +N more", () => {
+        const store = build([["a", "failed"], ["b", "cancelled"], ["c", "completed"]]);
+        assert.deepEqual(renderTaskWidgetLines(store, 6, style), ["Tasks 1/2", "✗ #1 a", "✓ ~#3 c~"]);
+        const many = build(Array.from({ length: 8 }, (_, i) => [`t${i}`] as [string]));
+        const lines = renderTaskWidgetLines(many, 6)!;
+        assert.equal(lines.length, 6);
+        assert.match(lines[5], /… \+4 more/);
+      });
+
+      it("open tasks fill the room exactly: no done line, never over maxLines", () => {
+        const store = build([
+          ["a", "completed"], ["b", "completed"],
+          ["c"], ["d"], ["e"], ["f"], ["g"], ["h"],
+        ]);
+        assert.deepEqual(renderTaskWidgetLines(store, 7, style), [
+          "Tasks 2/8", "○ #3 c", "○ #4 d", "○ #5 e", "○ #6 f", "○ #7 g", "○ #8 h",
+        ]);
+        for (let max = 1; max <= 9; max++) {
+          assert.ok(renderTaskWidgetLines(store, max)!.length <= max, `maxLines ${max}`);
+        }
+      });
+
+      it("identity default style: plain text", () => {
+        const store = build([["a", "completed"]]);
+        assert.deepEqual(renderTaskWidgetLines(store), ["Tasks 1/1", "✓ #1 a"]);
+      });
     });
 
     it("/tasks shows the full list", async () => {

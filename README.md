@@ -246,7 +246,7 @@ A change applies only while the task is `in_progress`, so a status you set by ha
 
 A `task` call stores the full list in its tool result `details`. A change made by the fork (a spawn or a child result) is stored as a `task-snapshot` custom entry. On session start, resume, fork and `/tree` navigation the list is rebuilt from the last snapshot on the current branch.
 
-A widget above the editor shows `Tasks <completed>/<total>` (cancelled tasks are not counted), then one line per open task: in progress, then ready, then blocked. It shows at most 6 lines and is hidden when the list is empty. `/tasks` prints the full list.
+A widget above the editor shows `Tasks <completed>/<total>` (cancelled tasks are not counted), then a checklist in id order: `✓` completed (struck through, dimmed), `▶` in progress, `○` ready, `·` blocked, `✗` failed. Cancelled tasks are hidden. It shows at most 7 lines: open tasks always get a row, and the oldest completed tasks fold into one `✓ N done` line when room is short. It is hidden when the list is empty. `/tasks` prints the full list.
 
 ## Terminal labels
 

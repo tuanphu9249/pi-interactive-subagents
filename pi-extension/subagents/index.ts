@@ -1639,8 +1639,21 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     ? null
     : new TaskController({
         appendEntry: (customType, data) => pi.appendEntry(customType, data),
-        setWidget: (lines) => {
-          if (latestCtx?.hasUI) latestCtx.ui.setWidget("tasks", lines);
+        setWidget: (render) => {
+          if (!latestCtx?.hasUI) return;
+          if (!render) {
+            latestCtx.ui.setWidget("tasks", undefined);
+            return;
+          }
+          latestCtx.ui.setWidget("tasks", (_tui: any, theme: any) => ({
+            invalidate() {},
+            // Same 1-column padding as Pi's plain string[] widgets; one row per task, cut to width.
+            render: (width: number) =>
+              render({
+                strike: (t) => theme.strikethrough(t),
+                dim: (t) => theme.fg("dim", t),
+              }).map((line) => ` ${truncateToWidth(line, Math.max(1, width - 2))}`),
+          }));
         },
         writeLabels: setTerminalLabels,
         parentTerminal: () => process.env.HC_TERMINAL_ID,

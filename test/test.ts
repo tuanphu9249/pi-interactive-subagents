@@ -64,6 +64,7 @@ import {
   findLatestAssistantError,
 } from "../pi-extension/subagents/subagent-done.ts";
 import { __pollForExitTest__ } from "../pi-extension/subagents/hc.ts";
+import { shouldRemindAboutTasks } from "../pi-extension/subagents/tasks.ts";
 
 // --- Helpers ---
 
@@ -2841,7 +2842,9 @@ describe("task tool", () => {
     const entries: Array<{ type: string; data: any }> = [];
     const widgets: Array<string[] | undefined> = [];
     const notes: string[] = [];
+    const active = { list: ["task"] };
     const pi: any = {
+      getActiveTools: () => active.list,
       on: (n: string, h: Function) => (handlers[n] = h),
       registerTool: (t: any) => tools.push(t),
       registerCommand: (n: string, c: any) => (commands[n] = c),
@@ -2858,7 +2861,7 @@ describe("task tool", () => {
     (subagentsModule as any).default(pi);
     const tool = tools.find((t) => t.name === "task");
     const run = (params: any) => tool.execute("id", params, undefined, undefined, ctx);
-    return { handlers, tools, commands, entries, widgets, notes, ctx, state, tool, run, pi };
+    return { handlers, tools, commands, entries, widgets, notes, ctx, state, tool, run, pi, active };
   }
 
   describe("store rules", () => {
@@ -3235,6 +3238,72 @@ describe("task tool", () => {
       state.branch = [snapEntry([task("1", "completed"), task("2", "in_progress")], 3)];
       handlers.session_start({ reason: "resume" }, ctx);
       assert.deepEqual(lastLabel(), ["pi.tasks=1/2", "pi.tasknow=#2 S2"]);
+    });
+  });
+
+  describe("guidelines and reminder", () => {
+    const asst = (tool?: string) => ({
+      type: "message",
+      message: { role: "assistant", content: tool ? [{ type: "toolCall", name: tool }] : [{ type: "text", text: "x" }] },
+    });
+    const turns = (n: number, tool?: string) => Array.from({ length: n }, () => asst(tool));
+    const snapEntry = (tasks: any[], nextId: number) => ({ type: "custom", customType: "task-snapshot", data: { tasks, nextId } });
+    const task = (id: string, status: string) => ({ id, subject: `S${id}`, status, blockedBy: [] });
+    const reminderEntry = { type: "custom_message", customType: "task-reminder" };
+    const saved = process.env.PI_SUBAGENT_TASK_REMINDER;
+    afterEach(() => restoreEnvVar("PI_SUBAGENT_TASK_REMINDER", saved));
+    const fire = (s: ReturnType<typeof setup>) => s.handlers.before_agent_start({}, s.ctx);
+
+    it("registers short guidelines and each bullet names task", () => {
+      const { tool } = setup();
+      assert.ok(Array.isArray(tool.promptGuidelines) && tool.promptGuidelines.length > 0);
+      for (const g of tool.promptGuidelines) assert.match(g, /`task`|\btask\b/);
+      assert.ok(tool.promptGuidelines.join("").length / 4 < 200);
+    });
+
+    it("counts turns: fires at 10, not at 9", () => {
+      assert.equal(shouldRemindAboutTasks(turns(10)), true);
+      assert.equal(shouldRemindAboutTasks(turns(9)), false);
+    });
+
+    it("does not fire when a task call is within 10 turns", () => {
+      assert.equal(shouldRemindAboutTasks([...turns(5), asst("task"), ...turns(9)]), false);
+      assert.equal(shouldRemindAboutTasks([...turns(5), asst("task"), ...turns(10)]), true);
+    });
+
+    it("does not fire within 10 turns after a reminder", () => {
+      assert.equal(shouldRemindAboutTasks([...turns(20), reminderEntry, ...turns(9)]), false);
+      assert.equal(shouldRemindAboutTasks([...turns(20), reminderEntry, ...turns(10)]), true);
+    });
+
+    it("hook returns a hidden message with the list when tasks exist", () => {
+      const s = setup([...turns(10)]);
+      const empty = fire(s);
+      assert.equal(empty.message.customType, "task-reminder");
+      assert.equal(empty.message.display, false);
+      assert.doesNotMatch(empty.message.content, /#1\./);
+      s.state.branch = [snapEntry([task("1", "pending"), task("2", "in_progress")], 3), ...turns(10)];
+      s.handlers.session_start({ reason: "resume" }, s.ctx);
+      const withList = fire(s);
+      assert.match(withList.message.content, /#1\. \[pending\] S1/);
+      assert.match(withList.message.content, /#2\. \[in_progress\] S2/);
+    });
+
+    it("hook stays quiet under 10 turns, when off, or when task is inactive", () => {
+      assert.equal(fire(setup(turns(9))), undefined);
+      process.env.PI_SUBAGENT_TASK_REMINDER = "off";
+      assert.equal(fire(setup(turns(10))), undefined);
+      delete process.env.PI_SUBAGENT_TASK_REMINDER;
+      const s = setup(turns(10));
+      s.active.list = ["subagent"];
+      assert.equal(fire(s), undefined);
+    });
+
+    it("no reminder in a child", () => {
+      process.env.PI_SUBAGENT_ID = "child1";
+      const s = setup(turns(10));
+      assert.equal(s.tool, undefined);
+      assert.equal(s.handlers.before_agent_start ? fire(s) : undefined, undefined);
     });
   });
 });

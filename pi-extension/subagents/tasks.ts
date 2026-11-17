@@ -423,3 +423,56 @@ export class TaskController {
     }
   }
 }
+
+// ---------------------------------------------------------------------------
+// guidelines and reminder
+// ---------------------------------------------------------------------------
+
+export const TASK_REMINDER_TURNS = 10;
+export const TASK_REMINDER_ENTRY = "task-reminder";
+
+/** Flat bullets in the system prompt. No tool prefix is added, so each names `task`. */
+export const TASK_PROMPT_GUIDELINES: string[] = [
+  "Use `task` for work with 3+ distinct steps or when the user gives a list, including steps you do yourself. Create the tasks before you start.",
+  "With `task`: set a task in_progress before you start it and completed right after it is done. Keep one in_progress at a time, unless subagents run tasks in parallel.",
+  "Do not set a `task` completed when tests fail or the work is partial.",
+  "Skip `task` for one-step requests and conversation.",
+  "`subagent({taskId})` updates the task status by itself.",
+];
+
+export function isTaskReminderDisabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.PI_SUBAGENT_TASK_REMINDER?.trim().toLowerCase() === "off";
+}
+
+function hasTaskToolCall(entry: any): boolean {
+  if (entry?.type !== "message" || entry.message?.role !== "assistant") return false;
+  const content = entry.message.content;
+  return Array.isArray(content) && content.some((c: any) => c?.type === "toolCall" && c.name === TASK_TOOL_NAME);
+}
+
+/** True when no `task` call and no reminder happened in the last `turns` assistant messages. */
+export function shouldRemindAboutTasks(entries: readonly any[], turns = TASK_REMINDER_TURNS): boolean {
+  let sinceTask: number | null = null;
+  let sinceReminder: number | null = null;
+  let assistants = 0;
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i];
+    if (sinceReminder === null && entry?.type === "custom_message" && entry.customType === TASK_REMINDER_ENTRY) {
+      sinceReminder = assistants;
+    }
+    if (entry?.type === "message" && entry.message?.role === "assistant") {
+      if (sinceTask === null && hasTaskToolCall(entry)) sinceTask = assistants;
+      assistants++;
+    }
+    if (sinceTask !== null && sinceReminder !== null) break;
+  }
+  return (sinceTask ?? assistants) >= turns && (sinceReminder ?? assistants) >= turns;
+}
+
+export function formatTaskReminder(store: TaskStore): string {
+  const text =
+    "The task tools haven't been used recently. If you're working on tasks that would benefit from tracking progress, consider using `task` (set to in_progress when starting, completed when done). Also consider cleaning up the task list if it has become stale and no longer matches what you are working on. Only use it if it's relevant to the current work. This is just a gentle reminder - ignore if not applicable.";
+  const tasks = store.all();
+  if (tasks.length === 0) return text;
+  return `${text}\n\nCurrent tasks:\n${tasks.map((t) => `#${t.id}. [${t.status}] ${t.subject}`).join("\n")}`;
+}

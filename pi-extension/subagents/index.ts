@@ -38,6 +38,11 @@ import {
   TaskController,
   TASK_STATUSES,
   TASK_TOOL_NAME,
+  TASK_PROMPT_GUIDELINES,
+  TASK_REMINDER_ENTRY,
+  formatTaskReminder,
+  isTaskReminderDisabled,
+  shouldRemindAboutTasks,
   formatTaskList,
   type TaskStatus,
 } from "./tasks.ts";
@@ -1651,6 +1656,22 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     rebuildTasks(ctx);
   });
 
+  // Hidden reminder after 10 quiet assistant turns. Parent only; never throws.
+  pi.on("before_agent_start", (_event, ctx) => {
+    try {
+      if (!taskController || isChild || isTaskReminderDisabled()) return;
+      if (!pi.getActiveTools().includes(TASK_TOOL_NAME)) return;
+      if (!shouldRemindAboutTasks(ctx.sessionManager.getBranch())) return;
+      return {
+        message: {
+          customType: TASK_REMINDER_ENTRY,
+          content: formatTaskReminder(taskController.store),
+          display: false,
+        },
+      };
+    } catch {}
+  });
+
   // /tree moves to another branch: rebuild the task list from that branch.
   pi.on("session_tree", (_event, ctx) => {
     latestCtx = ctx;
@@ -1927,7 +1948,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       name: TASK_TOOL_NAME,
       label: "Task",
       description:
-        "Session task list. list marks tasks ready (pending, blockers completed). subagent({taskId}) sets in_progress, completed, failed or cancelled itself.",
+        "Session task list for tracking multi-step work. list marks tasks ready (pending, blockers completed). subagent({taskId}) sets in_progress, completed, failed or cancelled itself.",
+      promptGuidelines: TASK_PROMPT_GUIDELINES,
       parameters: Type.Object({
         action: Type.Unsafe<"create" | "update" | "get" | "list">({
           type: "string",

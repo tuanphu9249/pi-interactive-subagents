@@ -746,9 +746,9 @@ export function taskWidgetStyle(theme: any): TaskWidgetStyle {
   return {
     strike: (t) => theme.strikethrough(t),
     dim: (t) => theme.fg("dim", t),
-    border: (t) => theme.fg("borderAccent", t),
+    border: (t) => theme.fg("warning", t),
     info: (t) => theme.fg("muted", t),
-    active: (t) => theme.fg("warning", t),
+    active: (t) => theme.fg("borderAccent", t),
     error: (t) => theme.fg("error", t),
   };
 }

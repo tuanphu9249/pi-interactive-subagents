@@ -3503,7 +3503,7 @@ describe("task tool", () => {
     const fakeRunning = () => (subagentsModule as any).__test__.runningSubagents.set("r1", { id: "r1", name: "W", startTime: Date.now() });
     afterEach(() => (subagentsModule as any).__test__.runningSubagents.clear());
 
-    it("gruvbox tokens: border and title warning, count muted, ▶ borderAccent, ✗ error, ✓ dim+struck, · dim, ○ plain", async () => {
+    it("gruvbox tokens: border and title syntaxKeyword (purple), count muted, ▶ warning, ✗ error, ✓ dim+struck, · dim, ○ plain", async () => {
       const { run, mounts, handlers, ctx } = setup();
       handlers.session_start({ reason: "startup" }, ctx);
       for (const [subject, status, blockedBy] of [["Setup", "completed"], ["Build", "in_progress"], ["Test"], ["Ship", undefined, ["3"]], ["Lint", "failed"]] as any[]) {
@@ -3511,11 +3511,11 @@ describe("task tool", () => {
         if (status) await run({ action: "update", id: created.details.taskId, status });
       }
       const lines = mounts.filter((m) => m.key === "tasks").at(-1)!.factory({}, tokenTheme).render(60);
-      assert.match(lines[0], /^<warning>╭─ ▾ Tasks ─+ <\/warning><muted>1\/5 done<\/muted><warning> ─╮<\/warning>$/);
-      assert.match(lines.at(-1), /^<warning>╰─+╯<\/warning>$/);
-      assert.match(lines[1], /^<warning>│<\/warning> <dim>✓ ~#1 Setup~<\/dim> +<warning>│<\/warning>$/);
-      assert.match(lines[2], /<borderAccent>▶ #2 Build<\/borderAccent>/);
-      assert.match(lines[3], /^<warning>│<\/warning> ○ #3 Test +<warning>│<\/warning>$/);
+      assert.match(lines[0], /^<syntaxKeyword>╭─ ▾ Tasks ─+ <\/syntaxKeyword><muted>1\/5 done<\/muted><syntaxKeyword> ─╮<\/syntaxKeyword>$/);
+      assert.match(lines.at(-1), /^<syntaxKeyword>╰─+╯<\/syntaxKeyword>$/);
+      assert.match(lines[1], /^<syntaxKeyword>│<\/syntaxKeyword> <dim>✓ ~#1 Setup~<\/dim> +<syntaxKeyword>│<\/syntaxKeyword>$/);
+      assert.match(lines[2], /<warning>▶ #2 Build<\/warning>/);
+      assert.match(lines[3], /^<syntaxKeyword>│<\/syntaxKeyword> ○ #3 Test +<syntaxKeyword>│<\/syntaxKeyword>$/);
       assert.match(lines[4], /<dim>· #4 Ship \(blocked by #3\)<\/dim>/);
       assert.match(lines[5], /<error>✗ #5 Lint<\/error>/);
       // The Subagents box keeps its own blue border; no theme token is used there.

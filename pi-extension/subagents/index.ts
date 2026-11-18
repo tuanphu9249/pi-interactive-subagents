@@ -741,14 +741,18 @@ function setTasksCollapsed(collapsed: boolean): void {
   } catch {}
 }
 
-/** Tasks box colours through theme tokens (gruvbox: aqua border, muted count, yellow in progress, red failed). */
+/**
+ * Tasks box colours through theme tokens (gruvbox: purple border, muted count, yellow in progress, red failed).
+ * The border uses `syntaxKeyword` because it is the only foreground token that is purple in gruvbox; purple stays
+ * clear of the blue Subagents box and of the status colours (yellow, red, green).
+ */
 export function taskWidgetStyle(theme: any): TaskWidgetStyle {
   return {
     strike: (t) => theme.strikethrough(t),
     dim: (t) => theme.fg("dim", t),
-    border: (t) => theme.fg("warning", t),
+    border: (t) => theme.fg("syntaxKeyword", t),
     info: (t) => theme.fg("muted", t),
-    active: (t) => theme.fg("borderAccent", t),
+    active: (t) => theme.fg("warning", t),
     error: (t) => theme.fg("error", t),
   };
 }

@@ -66,7 +66,14 @@ import {
   findLatestAssistantError,
 } from "../pi-extension/subagents/subagent-done.ts";
 import { __pollForExitTest__ } from "../pi-extension/subagents/hc.ts";
-import { shouldRemindAboutTasks, renderTaskWidgetLines, renderTaskWidgetBox, TASK_BOX_MIN_WIDTH, TaskStore } from "../pi-extension/subagents/tasks.ts";
+import {
+  shouldRemindAboutTasks,
+  renderTaskWidgetLines,
+  renderTaskWidgetBox,
+  renderTaskWidgetCollapsed,
+  TASK_BOX_MIN_WIDTH,
+  TaskStore,
+} from "../pi-extension/subagents/tasks.ts";
 
 // --- Helpers ---
 
@@ -2882,11 +2889,16 @@ describe("task tool", () => {
     id: process.env.PI_SUBAGENT_ID,
     term: process.env.HC_TERMINAL_ID,
     deny: process.env.PI_DENY_TOOLS,
+    agentDir: process.env.PI_CODING_AGENT_DIR,
   };
   let calls: { file: string; args: string[] }[];
+  /** Agent dir for this test: subagents-ui.json goes here, never to the real ~/.pi/agent. */
+  let agentDir: string;
 
   beforeEach(() => {
     calls = [];
+    agentDir = mkdtempSync(join(tmpdir(), "task-ui-"));
+    process.env.PI_CODING_AGENT_DIR = agentDir;
     delete process.env.PI_SUBAGENT_ID;
     delete process.env.PI_DENY_TOOLS;
     process.env.HC_TERMINAL_ID = "t1";
@@ -2904,6 +2916,8 @@ describe("task tool", () => {
     restoreEnvVar("PI_SUBAGENT_ID", savedEnv.id);
     restoreEnvVar("HC_TERMINAL_ID", savedEnv.term);
     restoreEnvVar("PI_DENY_TOOLS", savedEnv.deny);
+    restoreEnvVar("PI_CODING_AGENT_DIR", savedEnv.agentDir);
+    rmSync(agentDir, { recursive: true, force: true });
   });
 
   const labelCalls = () => calls.filter((c) => c.file === "hc" && c.args[0] === "label");
@@ -2919,7 +2933,12 @@ describe("task tool", () => {
     const commands: Record<string, any> = {};
     const entries: Array<{ type: string; data: any }> = [];
     const widgets: Array<string[] | undefined> = [];
+    /** Every setWidget call in order: key and the factory (undefined clears). */
+    const mounts: Array<{ key: string; factory: any }> = [];
     const notes: string[] = [];
+    const shortcuts: Record<string, any> = {};
+    const busHandlers: Record<string, Function> = {};
+    const unsubscribed: string[] = [];
     const active = { list: ["task"] };
     const pi: any = {
       getActiveTools: () => active.list,
@@ -2927,28 +2946,44 @@ describe("task tool", () => {
       registerTool: (t: any) => tools.push(t),
       registerCommand: (n: string, c: any) => (commands[n] = c),
       registerMessageRenderer() {},
-      registerShortcut() {},
+      registerShortcut: (k: string, o: any) => (shortcuts[k] = o),
       appendEntry: (type: string, data: any) => entries.push({ type, data }),
+      events: {
+        emit() {},
+        on: (ch: string, h: Function) => {
+          busHandlers[ch] = h;
+          return () => {
+            delete busHandlers[ch];
+            unsubscribed.push(ch);
+          };
+        },
+      },
     };
     const state = { branch };
     const ctx: any = {
       hasUI: true,
       ui: {
-        setWidget: (_k: string, c: any) =>
+        setWidget: (k: string, c: any) => {
+          mounts.push({ key: k, factory: c });
+          if (k !== "tasks") return;
           widgets.push(
             typeof c === "function"
-              ? c({}, { strikethrough: (t: string) => `~${t}~`, fg: (_n: string, t: string) => t })
+              ? c({}, plainTheme)
                   .render(80)
                   .map((l: string) => l.replace(/\x1b\[[0-9;]*m/g, "")) // plain text; colours are tested on renderTaskWidgetBox
               : c,
-          ), notify: (m: string) => notes.push(m) },
+          );
+        },
+        notify: (m: string) => notes.push(m),
+      },
       sessionManager: { getBranch: () => state.branch },
     };
     (subagentsModule as any).default(pi);
     const tool = tools.find((t) => t.name === "task");
     const run = (params: any) => tool.execute("id", params, undefined, undefined, ctx);
-    return { handlers, tools, commands, entries, widgets, notes, ctx, state, tool, run, pi, active };
+    return { handlers, tools, commands, entries, widgets, mounts, notes, shortcuts, busHandlers, unsubscribed, ctx, state, tool, run, pi, active };
   }
+  const plainTheme = { strikethrough: (t: string) => `~${t}~`, fg: (_n: string, t: string) => t };
 
   describe("store rules", () => {
     it("creates, updates and gets tasks with string integer ids", async () => {
@@ -3252,7 +3287,7 @@ describe("task tool", () => {
       const lines = widgets.at(-1)!;
       assert.equal(lines.length, 7); // 5 rows + 2 borders
       assert.ok(lines.every((l) => visibleWidth(l) === 80));
-      assert.match(lines[0], /^╭─ Tasks ─+ 1\/5 done ─╮$/);
+      assert.match(lines[0], /^╭─ ▾ Tasks ─+ 1\/5 done ─╮$/);
       assert.deepEqual(boxRows(lines), [
         "○ #1 Blocker",
         "· #2 Waits (blocked by #1)",
@@ -3286,7 +3321,9 @@ describe("task tool", () => {
       const marks = {
         strike: (t: string) => `~${t}~`,
         dim: (t: string) => `<dim>${t}</dim>`,
-        accent: (t: string) => `<acc>${t}</acc>`,
+        border: (t: string) => `<bd>${t}</bd>`,
+        info: (t: string) => `<info>${t}</info>`,
+        active: (t: string) => `<act>${t}</act>`,
         error: (t: string) => `<err>${t}</err>`,
       };
       const sample = () =>
@@ -3343,7 +3380,7 @@ describe("task tool", () => {
       it("applies colours per status through the injected style", () => {
         assert.deepEqual(renderTaskWidgetLines(sample(), 7, marks), [
           "<dim>✓ ~#1 Setup~</dim>",
-          "<acc>▶ #2 Build</acc>",
+          "<act>▶ #2 Build</act>",
           "○ #3 Test",
           "<dim>· #4 Ship (blocked by #3)</dim>",
           "<err>✗ #5 Lint</err>",
@@ -3351,11 +3388,11 @@ describe("task tool", () => {
       });
 
       it("box: border shape and exact width at several widths", () => {
-        for (const width of [24, 30, 60, 100]) {
+        for (const width of [TASK_BOX_MIN_WIDTH, 30, 60, 100]) {
           const lines = renderTaskWidgetBox(sample(), width)!;
           assert.equal(lines.length, 7, `height at ${width}`); // 5 rows + 2 borders
           for (const l of lines) assert.equal(visibleWidth(l), width, `width ${width}: ${l}`);
-          assert.match(lines[0], /^╭─ Tasks ─* 1\/5 done ─╮$/);
+          assert.match(lines[0], /^╭─ ▾ Tasks ─* 1\/5 done ─╮$/);
           assert.match(lines.at(-1)!, /^╰─+╯$/);
           for (const l of lines.slice(1, -1)) assert.match(l, /^│ .* │$/);
         }
@@ -3369,14 +3406,14 @@ describe("task tool", () => {
         assert.match(lines[1].replace(/\x1b\[[0-9;]*m/g, ""), /^│ ▶ #1 x+\.\.\. │$/);
       });
 
-      it("box: border and ▶ use accent, ✗ error, completed dim and struck; border chars are coloured", () => {
+      it("box: border and title use border, count info, ▶ active, ✗ error, completed dim and struck", () => {
         const lines = renderTaskWidgetBox(sample(), 60, marks)!;
-        assert.ok(lines[0].startsWith("<acc>╭") && lines[0].endsWith("╮</acc>"));
-        assert.ok(lines.at(-1)!.startsWith("<acc>╰") && lines.at(-1)!.endsWith("╯</acc>"));
-        assert.ok(lines[1].startsWith("<acc>│</acc> <dim>✓ ~#1 Setup~</dim>"));
-        assert.ok(lines[1].endsWith(" <acc>│</acc>"));
-        assert.match(lines[2], /<acc>▶ #2 Build<\/acc>/);
-        assert.match(lines[3], /^<acc>│<\/acc> ○ #3 Test +<acc>│<\/acc>$/);
+        assert.match(lines[0], /^<bd>╭─ ▾ Tasks ─+ <\/bd><info>1\/5 done<\/info><bd> ─╮<\/bd>$/);
+        assert.ok(lines.at(-1)!.startsWith("<bd>╰") && lines.at(-1)!.endsWith("╯</bd>"));
+        assert.ok(lines[1].startsWith("<bd>│</bd> <dim>✓ ~#1 Setup~</dim>"));
+        assert.ok(lines[1].endsWith(" <bd>│</bd>"));
+        assert.match(lines[2], /<act>▶ #2 Build<\/act>/);
+        assert.match(lines[3], /^<bd>│<\/bd> ○ #3 Test +<bd>│<\/bd>$/);
         assert.match(lines[4], /<dim>· #4 Ship \(blocked by #3\)<\/dim>/);
         assert.match(lines[5], /<err>✗ #5 Lint<\/err>/);
       });
@@ -3386,7 +3423,9 @@ describe("task tool", () => {
         const coloured = renderTaskWidgetBox(sample(), 60, {
           strike: (t) => `\x1b[9m${t}\x1b[29m`,
           dim: (t) => `\x1b[2m${t}\x1b[22m`,
-          accent: (t) => `\x1b[38;2;77;163;255m${t}\x1b[0m`,
+          border: (t) => `\x1b[38;2;142;192;124m${t}\x1b[39m`,
+          info: (t) => `\x1b[2m${t}\x1b[22m`,
+          active: (t) => `\x1b[33m${t}\x1b[39m`,
           error: (t) => `\x1b[31m${t}\x1b[39m`,
         })!;
         assert.deepEqual(coloured.map((l) => visibleWidth(l)), plain.map((l) => visibleWidth(l)));
@@ -3421,7 +3460,7 @@ describe("task tool", () => {
       it("narrow terminal: unboxed lines cut to the width", () => {
         const width = TASK_BOX_MIN_WIDTH - 1;
         const lines = renderTaskWidgetBox(sample(), width)!;
-        assert.equal(lines[0], "Tasks 1/5");
+        assert.equal(lines[0], "▾ Tasks 1/5");
         assert.equal(lines.length, 6);
         assert.ok(!lines.some((l) => /[╭╮╰╯│]/.test(l)));
         for (const l of lines) assert.ok(visibleWidth(l) <= width, l);
@@ -3434,11 +3473,222 @@ describe("task tool", () => {
       });
     });
 
-    it("/tasks shows the full list", async () => {
+    it("/tasks list shows the full list", async () => {
       const { run, commands, ctx, notes } = setup();
       await run({ action: "create", subject: "A" });
-      await commands.tasks.handler("", ctx);
+      await commands.tasks.handler("list", ctx);
       assert.match(notes[0], /#1 \[pending\] ready A/);
+    });
+  });
+
+  describe("tasks widget: colours, collapse and order", () => {
+    const build = (specs: Array<[string, string?, string[]?]>) => {
+      const store = new TaskStore();
+      for (const [subject, status, blockedBy] of specs) {
+        const t = store.create({ subject, blockedBy });
+        if (status) store.update({ id: t.id, status });
+      }
+      return store;
+    };
+    const sample = () =>
+      build([["Setup", "completed"], ["Build", "in_progress"], ["Test"], ["Ship", undefined, ["3"]], ["Lint", "failed"]]);
+    /** Theme that wraps text in its token name, so a test sees which token coloured what. */
+    const tokenTheme = { strikethrough: (t: string) => `~${t}~`, fg: (n: string, t: string) => `<${n}>${t}</${n}>` };
+    const strip = (l: string) => l.replace(/\x1b\[[0-9;]*m/g, "");
+    const mouse = (type: string, y: number, button = "left") => ({
+      type, button, x: 3, y, screenX: 3, screenY: 20 + y, width: 80, height: 7, shift: false, alt: false, ctrl: false,
+    });
+    const uiFile = () => join(agentDir, "subagents-ui.json");
+    const lastTasks = (s: ReturnType<typeof setup>) => s.mounts.filter((m) => m.key === "tasks").at(-1)!.factory({}, plainTheme);
+    const fakeRunning = () => (subagentsModule as any).__test__.runningSubagents.set("r1", { id: "r1", name: "W", startTime: Date.now() });
+    afterEach(() => (subagentsModule as any).__test__.runningSubagents.clear());
+
+    it("gruvbox tokens: border and title borderAccent, count muted, ▶ warning, ✗ error, ✓ dim+struck, · dim, ○ plain", async () => {
+      const { run, mounts, handlers, ctx } = setup();
+      handlers.session_start({ reason: "startup" }, ctx);
+      for (const [subject, status, blockedBy] of [["Setup", "completed"], ["Build", "in_progress"], ["Test"], ["Ship", undefined, ["3"]], ["Lint", "failed"]] as any[]) {
+        const created = await run({ action: "create", subject, blockedBy });
+        if (status) await run({ action: "update", id: created.details.taskId, status });
+      }
+      const lines = mounts.filter((m) => m.key === "tasks").at(-1)!.factory({}, tokenTheme).render(60);
+      assert.match(lines[0], /^<borderAccent>╭─ ▾ Tasks ─+ <\/borderAccent><muted>1\/5 done<\/muted><borderAccent> ─╮<\/borderAccent>$/);
+      assert.match(lines.at(-1), /^<borderAccent>╰─+╯<\/borderAccent>$/);
+      assert.match(lines[1], /^<borderAccent>│<\/borderAccent> <dim>✓ ~#1 Setup~<\/dim> +<borderAccent>│<\/borderAccent>$/);
+      assert.match(lines[2], /<warning>▶ #2 Build<\/warning>/);
+      assert.match(lines[3], /^<borderAccent>│<\/borderAccent> ○ #3 Test +<borderAccent>│<\/borderAccent>$/);
+      assert.match(lines[4], /<dim>· #4 Ship \(blocked by #3\)<\/dim>/);
+      assert.match(lines[5], /<error>✗ #5 Lint<\/error>/);
+      // The Subagents box keeps its own blue border; no theme token is used there.
+      assert.doesNotMatch(lines.join(""), /<accent>/);
+    });
+
+    it("collapsed line: one line, never wider than the width (1-220), hint only when it fits", () => {
+      const hint = "ctrl+alt+t";
+      const ansi = {
+        strike: (t: string) => `\x1b[9m${t}\x1b[29m`,
+        dim: (t: string) => `\x1b[2m${t}\x1b[22m`,
+        border: (t: string) => `\x1b[36m${t}\x1b[39m`,
+        info: (t: string) => `\x1b[2m${t}\x1b[22m`,
+        active: (t: string) => `\x1b[33m${t}\x1b[39m`,
+      };
+      const long = build([["a", "completed"], ["Inbox sidebar with a long subject that does not fit", "in_progress"]]);
+      for (const store of [sample(), long]) {
+        for (let w = 1; w <= 220; w++) {
+          for (const style of [{}, ansi]) {
+            const lines = renderTaskWidgetCollapsed(store, w, style, hint)!;
+            assert.equal(lines.length, 1, `width ${w}`);
+            assert.ok(visibleWidth(lines[0]) <= w, `width ${w}: ${lines[0]}`);
+          }
+        }
+      }
+      assert.deepEqual(renderTaskWidgetCollapsed(sample(), 0), []);
+      assert.equal(renderTaskWidgetCollapsed(new TaskStore(), 80), undefined);
+      assert.deepEqual(renderTaskWidgetCollapsed(sample(), 120, {}, hint), ["╶ ▸ Tasks 1/5 done · ▶ #2 Build · ctrl+alt+t ╴"]);
+      // Hint dropped first, then the task text is cut.
+      assert.deepEqual(renderTaskWidgetCollapsed(sample(), 35, {}, hint), ["╶ ▸ Tasks 1/5 done · ▶ #2 Build ╴"]);
+      const cut = renderTaskWidgetCollapsed(long, 40, {}, hint)![0];
+      assert.match(cut, /^╶ ▸ Tasks 1\/2 done · ▶ #2 Inbox.*… ╴$/);
+      assert.equal(visibleWidth(cut), 40);
+      // No task in progress: the next ready one. Nothing open: only the count.
+      assert.deepEqual(renderTaskWidgetCollapsed(build([["a", "completed"], ["b"]]), 80), ["╶ ▸ Tasks 1/2 done · ○ #2 b ╴"]);
+      assert.deepEqual(renderTaskWidgetCollapsed(build([["a", "completed"]]), 80), ["╶ ▸ Tasks 1/1 done ╴"]);
+    });
+
+    it("a left click on the title line toggles; other lines, other buttons and drags pass through", async () => {
+      const s = setup();
+      s.handlers.session_start({ reason: "startup" }, s.ctx);
+      await s.run({ action: "create", subject: "A" });
+      await s.run({ action: "update", id: "1", status: "in_progress" });
+      const widget = lastTasks(s);
+      assert.equal(widget.render(80).length, 3);
+      for (const type of ["press", "release", "click"]) assert.equal(widget.handleMouse(mouse(type, 1)), undefined);
+      assert.equal(widget.handleMouse(mouse("click", 0, "right")), undefined);
+      assert.equal(widget.handleMouse(mouse("drag", 0)), undefined);
+      assert.equal(widget.render(80).length, 3, "still expanded");
+
+      // Pi sends press, release, then click to the component that handled the press.
+      assert.equal(widget.handleMouse(mouse("press", 0)).handled, true);
+      assert.equal(widget.handleMouse(mouse("release", 0)).handled, true);
+      assert.equal(widget.handleMouse(mouse("click", 0)).handled, true);
+      const collapsed = widget.render(80).map(strip);
+      assert.deepEqual(collapsed, ["╶ ▸ Tasks 0/1 done · ▶ #1 A · ctrl+alt+t ╴"]);
+      widget.handleMouse(mouse("click", 0));
+      assert.match(strip(widget.render(80)[0]), /^╭─ ▾ Tasks/);
+    });
+
+    it("pi-tui routes a click in the widget container to the Tasks title line", async () => {
+      const { Container, Spacer } = await import("@earendil-works/pi-tui");
+      const s = setup();
+      s.handlers.session_start({ reason: "startup" }, s.ctx);
+      await s.run({ action: "create", subject: "A" });
+      const widget = lastTasks(s);
+      // Like Pi's above-editor container: a spacer line, then the widgets.
+      const container = new Container();
+      container.addChild(new Spacer(1));
+      container.addChild(widget);
+      container.render(80);
+      const at = (y: number) => ({ ...mouse("press", y), height: 4 });
+      assert.equal(container.handleMouse(at(2)), undefined, "a row line is not consumed");
+      const hit = container.handleMouse(at(1));
+      assert.equal(hit?.handled, true);
+      assert.equal(hit?.target.component, widget);
+      container.handleMouse({ ...at(1), type: "click" });
+      assert.equal(widget.render(80).length, 1);
+    });
+
+    it("the collapsed state persists in subagents-ui.json and loads on the next start", async () => {
+      const first = setup();
+      first.handlers.session_start({ reason: "startup" }, first.ctx);
+      await first.run({ action: "create", subject: "A" });
+      lastTasks(first).handleMouse(mouse("click", 0));
+      assert.deepEqual(JSON.parse(readFileSync(uiFile(), "utf8")), { tasksCollapsed: true });
+
+      // /reload or a new session loads the extension again.
+      const second = setup();
+      second.handlers.session_start({ reason: "reload" }, second.ctx);
+      await second.run({ action: "create", subject: "B" });
+      assert.equal(second.widgets.at(-1)!.length, 1);
+      await second.commands.tasks.handler("", second.ctx);
+      assert.deepEqual(JSON.parse(readFileSync(uiFile(), "utf8")), { tasksCollapsed: false });
+      assert.ok(second.widgets.at(-1)!.length > 1);
+
+      // Other keys in the file are kept; a broken file means expanded.
+      writeFileSync(uiFile(), JSON.stringify({ other: 1, tasksCollapsed: true }));
+      const third = setup();
+      await third.commands.tasks.handler("", third.ctx); // empty list: only says so
+      assert.match(third.notes.at(-1)!, /No tasks/);
+      third.handlers.session_start({ reason: "startup" }, third.ctx);
+      await third.run({ action: "create", subject: "C" });
+      await third.commands.tasks.handler("", third.ctx);
+      assert.deepEqual(JSON.parse(readFileSync(uiFile(), "utf8")), { other: 1, tasksCollapsed: false });
+      writeFileSync(uiFile(), "{not json");
+      const fourth = setup();
+      fourth.handlers.session_start({ reason: "startup" }, fourth.ctx);
+      await fourth.run({ action: "create", subject: "D" });
+      assert.ok(fourth.widgets.at(-1)!.length > 1);
+    });
+
+    it("registers the ctrl+alt+t shortcut and /tasks toggles; a child registers neither", async () => {
+      const s = setup();
+      s.handlers.session_start({ reason: "startup" }, s.ctx);
+      assert.deepEqual(Object.keys(s.shortcuts), ["ctrl+alt+t"]);
+      assert.match(s.shortcuts["ctrl+alt+t"].description, /Tasks box/);
+      await s.run({ action: "create", subject: "A" });
+      await s.shortcuts["ctrl+alt+t"].handler(s.ctx);
+      assert.equal(s.widgets.at(-1)!.length, 1);
+      await s.commands.tasks.handler("", s.ctx);
+      assert.equal(s.widgets.at(-1)!.length, 3);
+
+      process.env.PI_SUBAGENT_ID = "child1";
+      const child = setup();
+      assert.deepEqual(Object.keys(child.shortcuts), []);
+      assert.equal(child.commands.tasks, undefined);
+    });
+
+    it("on ui:widget-shown, re-mounts Tasks then Subagents (only those shown); shutdown unsubscribes", async () => {
+      const s = setup();
+      s.handlers.session_start({ reason: "startup" }, s.ctx);
+      const shown = () => s.busHandlers["ui:widget-shown"]({ key: "heads-up" });
+      const keys = () => s.mounts.splice(0).map((m) => m.key);
+
+      keys();
+      shown();
+      assert.deepEqual(keys(), [], "nothing shown: nothing re-mounted");
+
+      await s.run({ action: "create", subject: "A" });
+      keys();
+      shown();
+      assert.deepEqual(keys(), ["tasks"]);
+
+      fakeRunning();
+      shown();
+      assert.deepEqual(keys(), ["tasks", "subagent-status"]);
+
+      // A tasks refresh re-mounts Subagents right after Tasks.
+      await s.run({ action: "update", id: "1", status: "in_progress" });
+      assert.deepEqual(keys(), ["tasks", "subagent-status"]);
+
+      // A new session_start does not subscribe twice.
+      s.handlers.session_start({ reason: "new" }, s.ctx);
+      assert.deepEqual(s.unsubscribed, ["ui:widget-shown"]);
+      assert.equal(typeof s.busHandlers["ui:widget-shown"], "function");
+      s.handlers.session_shutdown({}, s.ctx);
+      assert.deepEqual(s.unsubscribed, ["ui:widget-shown", "ui:widget-shown"]);
+      assert.equal(s.busHandlers["ui:widget-shown"], undefined);
+    });
+
+    it("a stale ctx on the event or a refresh does not throw", async () => {
+      const s = setup();
+      s.handlers.session_start({ reason: "startup" }, s.ctx);
+      await s.run({ action: "create", subject: "A" });
+      fakeRunning();
+      const handler = s.busHandlers["ui:widget-shown"];
+      for (const key of ["hasUI", "ui"]) {
+        Object.defineProperty(s.ctx, key, { get() { throw new Error("This extension ctx is stale"); } });
+      }
+      assert.doesNotThrow(() => handler({ key: "heads-up" }));
+      await assert.doesNotReject(s.run({ action: "update", id: "1", status: "in_progress" }));
+      await assert.doesNotReject(s.shortcuts["ctrl+alt+t"].handler(s.ctx));
     });
   });
 

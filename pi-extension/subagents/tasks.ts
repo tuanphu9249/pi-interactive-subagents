@@ -11,7 +11,7 @@
  * from the last snapshot on the current branch.
  */
 
-import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { sliceByColumn, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
 export const TASK_STATUSES = ["pending", "in_progress", "completed", "failed", "cancelled"] as const;
 export type TaskStatus = (typeof TASK_STATUSES)[number];
@@ -224,14 +224,25 @@ export interface TaskWidgetStyle {
   strike?: (text: string) => string;
   /** Dim a whole row (completed, blocked, fold). Default: identity. */
   dim?: (text: string) => string;
-  /** Accent colour: box border and in-progress rows. Default: identity. */
-  accent?: (text: string) => string;
+  /** Box border and the `Tasks` title. Default: identity. */
+  border?: (text: string) => string;
+  /** The `N/M done` count in the top border. Default: identity. */
+  info?: (text: string) => string;
+  /** In-progress rows. Default: identity. */
+  active?: (text: string) => string;
   /** Error colour: failed rows. Default: identity. */
   error?: (text: string) => string;
 }
 
-/** Narrowest width that still fits the top border `╭─ Tasks ─ N/M done ─╮`; below it the widget is unboxed. */
-export const TASK_BOX_MIN_WIDTH = 24;
+/** How the Tasks widget shows: the full box, or one collapsed line. */
+export interface TaskWidgetView {
+  collapsed?: boolean;
+  /** Toggle key shown at the end of the collapsed line, only when the whole line fits. */
+  hint?: string;
+}
+
+/** Narrowest width for the boxed widget (top border `╭─ ▾ Tasks ─ N/M done ─╮`); below it the widget is unboxed. */
+export const TASK_BOX_MIN_WIDTH = 26;
 
 function rowsFor(
   store: TaskStore,
@@ -240,7 +251,7 @@ function rowsFor(
 ): { rows: string[]; completed: number; total: number } | undefined {
   const strike = style.strike ?? ((t: string) => t);
   const dim = style.dim ?? ((t: string) => t);
-  const accent = style.accent ?? ((t: string) => t);
+  const active = style.active ?? ((t: string) => t);
   const error = style.error ?? ((t: string) => t);
   if (store.all().length === 0) return undefined;
   const tasks = store.all().filter((t) => t.status !== "cancelled");
@@ -252,7 +263,7 @@ function rowsFor(
       case "completed":
         return dim(`✓ ${strike(`#${t.id} ${t.subject}`)}`);
       case "in_progress":
-        return accent(`▶ #${t.id} ${t.activeForm || t.subject}${t.owner ? ` (${t.owner})` : ""}`);
+        return active(`▶ #${t.id} ${t.activeForm || t.subject}${t.owner ? ` (${t.owner})` : ""}`);
       case "failed":
         return error(`✗ #${t.id} ${t.subject}`);
       default:
@@ -291,7 +302,7 @@ function rowsFor(
 
 /**
  * Task rows (no header), in id order (checklist):
- * ✓ completed (struck, dim), ▶ in_progress (accent), ○ ready, · blocked (dim), ✗ failed (error). Cancelled tasks are hidden.
+ * ✓ completed (struck, dim), ▶ in_progress (active), ○ ready, · blocked (dim), ✗ failed (error). Cancelled tasks are hidden.
  * At most `maxLines` rows. Open tasks (not completed) always win room. If room is short,
  * the oldest completed tasks drop first and one `✓ N done` row replaces them.
  * If open tasks alone overflow, show the first ones (in_progress, failed, ready, blocked) and `… +N more`.
@@ -307,12 +318,13 @@ export function renderTaskWidgetLines(
 
 /**
  * Task widget as a box like the subagent widget:
- *   ╭─ Tasks ──────── 3/7 done ─╮
+ *   ╭─ ▾ Tasks ────── 3/7 done ─╮
  *   │ ✓ #1 a                    │
  *   ╰───────────────────────────╯
- * Border in the accent colour; rows cut and padded to `width`. The box has at most `maxLines` rows
- * plus two borders. Below TASK_BOX_MIN_WIDTH the widget is unboxed: a `Tasks N/M` line, then the rows,
- * each cut to `width`. Returns undefined when the store is empty.
+ * Border and title in the border colour, the count in the info colour; rows cut and padded to `width`. The box has at most `maxLines` rows
+ * plus two borders. Below TASK_BOX_MIN_WIDTH, or when the top border does not fit, the widget is unboxed:
+ * a `▾ Tasks N/M` line, then the rows, each cut to `width`. Returns undefined when the store is empty.
+ * The first line is always the title line, which a click toggles.
  */
 export function renderTaskWidgetBox(
   store: TaskStore,
@@ -323,27 +335,88 @@ export function renderTaskWidgetBox(
   const res = rowsFor(store, maxLines, style);
   if (!res) return undefined;
   if (width <= 0) return [];
-  const accent = style.accent ?? ((t: string) => t);
+  const border = style.border ?? ((t: string) => t);
+  const info = style.info ?? ((t: string) => t);
   const { rows, completed, total } = res;
+  const inner = width - 2;
+  const titlePart = "─ ▾ Tasks ";
+  const count = `${completed}/${total} done`;
 
-  if (width < TASK_BOX_MIN_WIDTH) {
-    return [`Tasks ${completed}/${total}`, ...rows].map((l, i) =>
-      truncateToWidth(i === 0 ? accent(l) : l, width),
+  if (width < TASK_BOX_MIN_WIDTH || titlePart.length + count.length + 3 > inner) {
+    return [`▾ Tasks ${completed}/${total}`, ...rows].map((l, i) =>
+      truncateToWidth(i === 0 ? border(l) : l, width),
     );
   }
 
-  const inner = width - 2;
-  const titlePart = "─ Tasks ";
-  const infoPart = ` ${completed}/${total} done ─`;
-  const fill = "─".repeat(Math.max(0, inner - titlePart.length - infoPart.length));
-  const bar = accent("│");
-  const lines = [accent(`╭${titlePart}${fill}${infoPart}╮`)];
+  const fill = "─".repeat(Math.max(0, inner - titlePart.length - count.length - 3));
+  const bar = border("│");
+  const lines = [`${border(`╭${titlePart}${fill} `)}${info(count)}${border(" ─╮")}`];
   for (const row of rows) {
     const cut = truncateToWidth(row, inner - 2);
     lines.push(`${bar} ${cut}${" ".repeat(Math.max(0, inner - 2 - visibleWidth(cut)))} ${bar}`);
   }
-  lines.push(accent(`╰${"─".repeat(inner)}╯`));
+  lines.push(border(`╰${"─".repeat(inner)}╯`));
   return lines;
+}
+
+/**
+ * Collapsed Tasks widget, one line no wider than `width`:
+ *   ╶ ▸ Tasks 3/7 done · ▶ #4 Writing docs · ctrl+alt+t ╴
+ * It shows the first in-progress task, else the first ready one. The task text is cut first; the hint
+ * shows only when the whole line fits. Returns undefined when the store is empty, [] when `width` <= 0.
+ */
+export function renderTaskWidgetCollapsed(
+  store: TaskStore,
+  width: number,
+  style: TaskWidgetStyle = {},
+  hint?: string,
+): string[] | undefined {
+  if (store.all().length === 0) return undefined;
+  if (width <= 0) return [];
+  const border = style.border ?? ((t: string) => t);
+  const info = style.info ?? ((t: string) => t);
+  const active = style.active ?? ((t: string) => t);
+  const dim = style.dim ?? ((t: string) => t);
+  const { completed, total } = countTasks(store.all());
+  const tasks = store.all();
+  const doing = tasks.find((t) => t.status === "in_progress");
+  const ready = doing ? undefined : tasks.find((t) => store.isReady(t));
+  // Plain text first: it is cut before it gets a colour, so the plain style gives plain text.
+  const current = doing
+    ? `▶ #${doing.id} ${doing.activeForm || doing.subject}`
+    : ready
+      ? `○ #${ready.id} ${ready.subject}`
+      : "";
+  const paint = doing ? active : (t: string) => t;
+
+  const head = `${border("╶ ▸ Tasks ")}${info(`${completed}/${total} done`)}`;
+  const tail = border(" ╴");
+  const sep = border(" · ");
+  const key = hint ? `${sep}${dim(hint)}` : "";
+  const fixed = visibleWidth(head) + visibleWidth(tail);
+  const room = width - fixed - visibleWidth(sep);
+  const currentWidth = visibleWidth(current);
+
+  let line: string;
+  if (current && currentWidth + visibleWidth(key) <= room) line = `${head}${sep}${paint(current)}${key}${tail}`;
+  else if (current && currentWidth <= room) line = `${head}${sep}${paint(current)}${tail}`;
+  // Room for a few characters of the task: cut the task text.
+  else if (current && room >= 4) line = `${head}${sep}${paint(`${sliceByColumn(current, 0, room - 1, true)}…`)}${tail}`;
+  else if (!current && visibleWidth(key) <= width - fixed) line = `${head}${key}${tail}`;
+  else line = `${head}${tail}`;
+  return [truncateToWidth(line, width, "")];
+}
+
+/** Tasks widget in the given view: the box, or the collapsed line. */
+export function renderTaskWidget(
+  store: TaskStore,
+  width: number,
+  style: TaskWidgetStyle = {},
+  view: TaskWidgetView = {},
+): string[] | undefined {
+  return view.collapsed
+    ? renderTaskWidgetCollapsed(store, width, style, view.hint)
+    : renderTaskWidgetBox(store, width, style);
 }
 
 /** Labels for the parent terminal. Empty string means: remove the label. */
@@ -390,11 +463,14 @@ export function findLastSnapshot(entries: readonly any[]): TaskSnapshot | null {
 // controller
 // ---------------------------------------------------------------------------
 
+/** Draws the Tasks widget at a width, in a style and view. */
+export type TaskWidgetRender = (width: number, style: TaskWidgetStyle, view?: TaskWidgetView) => string[];
+
 export interface TaskControllerDeps {
   /** Persist a snapshot as a session custom entry. */
   appendEntry?: (customType: string, data: unknown) => void;
   /** Set or clear (undefined) the widget above the editor. */
-  setWidget?: (render: ((width: number, style: TaskWidgetStyle) => string[]) | undefined) => void;
+  setWidget?: (render: TaskWidgetRender | undefined) => void;
   /** Write labels on a terminal. Empty value removes the label. May throw. */
   writeLabels?: (terminalId: string, labels: Record<string, string>) => void;
   /** Parent terminal id (`$HC_TERMINAL_ID`). */
@@ -433,7 +509,7 @@ export class TaskController {
     try {
       const has = this.store.all().length > 0;
       this.deps.setWidget?.(
-        has ? (width, style) => renderTaskWidgetBox(this.store, width, style) ?? [] : undefined,
+        has ? (width, style, view) => renderTaskWidget(this.store, width, style, view) ?? [] : undefined,
       );
     } catch {}
     this.writeParentLabels();

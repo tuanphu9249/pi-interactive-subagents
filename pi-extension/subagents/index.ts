@@ -1,7 +1,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { keyHint } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "@sinclair/typebox";
-import { Box, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { Box, Text, truncateToWidth, visibleWidth, type TuiMouseEvent, type TuiMouseEventResult } from "@earendil-works/pi-tui";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -45,6 +45,8 @@ import {
   shouldRemindAboutTasks,
   formatTaskList,
   type TaskStatus,
+  type TaskWidgetRender,
+  type TaskWidgetStyle,
 } from "./tasks.ts";
 
 import {
@@ -673,30 +675,125 @@ function renderSubagentWidgetLines(agents: RunningSubagent[], width: number): st
 }
 
 function updateWidget() {
-  if (!latestCtx?.hasUI) return;
+  // Runs from timers and event handlers. After /reload or a session switch latestCtx can be stale, and any
+  // access then throws; uncaught there, it ends Pi.
+  try {
+    if (!latestCtx?.hasUI) return;
 
-  if (runningSubagents.size === 0) {
-    latestCtx.ui.setWidget("subagent-status", undefined);
-    if (widgetInterval) {
-      clearInterval(widgetInterval);
-      widgetInterval = null;
-      (globalThis as any)[WIDGET_INTERVAL_KEY] = null;
+    if (runningSubagents.size === 0) {
+      latestCtx.ui.setWidget("subagent-status", undefined);
+      if (widgetInterval) {
+        clearInterval(widgetInterval);
+        widgetInterval = null;
+        (globalThis as any)[WIDGET_INTERVAL_KEY] = null;
+      }
+      return;
     }
-    return;
-  }
 
-  latestCtx.ui.setWidget(
-    "subagent-status",
-    (_tui: any, _theme: any) => {
-      return {
-        invalidate() {},
-        render(width: number) {
-          return renderSubagentWidgetLines(Array.from(runningSubagents.values()), width);
-        },
-      };
-    },
-    { placement: "aboveEditor" },
-  );
+    latestCtx.ui.setWidget(
+      "subagent-status",
+      (_tui: any, _theme: any) => {
+        return {
+          invalidate() {},
+          render(width: number) {
+            return renderSubagentWidgetLines(Array.from(runningSubagents.values()), width);
+          },
+        };
+      },
+      { placement: "aboveEditor" },
+    );
+  } catch {}
+}
+
+// ── Tasks widget: colours, collapse and mount order ──
+
+/** Key that collapses or expands the Tasks box. Free in Pi 1.5.2's default keybindings. */
+export const TASKS_TOGGLE_KEY = "ctrl+alt+t";
+
+/** Latest Tasks render from the controller; undefined while the list is empty. */
+let taskRender: TaskWidgetRender | undefined;
+
+/** Tasks box collapsed to one line. Loaded from subagents-ui.json when the extension starts. */
+let tasksCollapsed = false;
+
+/** Small UI state file. It keeps the collapsed state across /reload and new sessions. */
+function uiStateFile(): string {
+  return join(getAgentConfigDir(), "subagents-ui.json");
+}
+
+function readUiState(): Record<string, unknown> {
+  try {
+    const parsed = JSON.parse(readFileSync(uiStateFile(), "utf8"));
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function loadTasksCollapsed(): boolean {
+  return readUiState().tasksCollapsed === true;
+}
+
+function setTasksCollapsed(collapsed: boolean): void {
+  tasksCollapsed = collapsed;
+  try {
+    writeFileSync(uiStateFile(), `${JSON.stringify({ ...readUiState(), tasksCollapsed: collapsed })}\n`, "utf8");
+  } catch {}
+}
+
+/** Tasks box colours through theme tokens (gruvbox: aqua border, muted count, yellow in progress, red failed). */
+export function taskWidgetStyle(theme: any): TaskWidgetStyle {
+  return {
+    strike: (t) => theme.strikethrough(t),
+    dim: (t) => theme.fg("dim", t),
+    border: (t) => theme.fg("borderAccent", t),
+    info: (t) => theme.fg("muted", t),
+    active: (t) => theme.fg("warning", t),
+    error: (t) => theme.fg("error", t),
+  };
+}
+
+/**
+ * Fullscreen mode sends mouse events to widgets, with `y` local to the widget. A left click on the title line
+ * (line 0) toggles the box. The press must be handled too, or Pi starts a text selection and sends no click.
+ * Other lines are not handled, so selection there still works.
+ */
+function handleTasksMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+  if (event.y !== 0 || event.button !== "left") return undefined;
+  if (event.type === "click") {
+    setTasksCollapsed(!tasksCollapsed);
+    return { handled: true, render: true };
+  }
+  if (event.type === "press" || event.type === "release") return { handled: true, render: false };
+  return undefined;
+}
+
+/** Mount or clear the Tasks widget. Never throws: latestCtx can be stale. */
+function mountTasksWidget(): void {
+  try {
+    if (!latestCtx?.hasUI) return;
+    const render = taskRender;
+    if (!render) {
+      latestCtx.ui.setWidget("tasks", undefined);
+      return;
+    }
+    latestCtx.ui.setWidget("tasks", (_tui: any, theme: any) => ({
+      invalidate() {},
+      // Reads tasksCollapsed on every render, so a click needs no re-mount.
+      render: (width: number) =>
+        render(width, taskWidgetStyle(theme), { collapsed: tasksCollapsed, hint: TASKS_TOGGLE_KEY }),
+      handleMouse: handleTasksMouse,
+    }));
+  } catch {}
+}
+
+/**
+ * Pi draws above-editor widgets in the order they were last set. Re-mount Tasks, then Subagents (each only
+ * when shown), so a note set before them (heads-up, recap) stays above and Subagents stays below Tasks.
+ */
+function remountTaskAndSubagentWidgets(): void {
+  if (taskRender) mountTasksWidget();
+  if (runningSubagents.size > 0) updateWidget();
 }
 
 /**
@@ -1639,23 +1736,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     ? null
     : new TaskController({
         appendEntry: (customType, data) => pi.appendEntry(customType, data),
+        // Every refresh re-mounts Tasks, then Subagents right after it, so Subagents stays the lowest box.
         setWidget: (render) => {
-          if (!latestCtx?.hasUI) return;
-          if (!render) {
-            latestCtx.ui.setWidget("tasks", undefined);
-            return;
-          }
-          latestCtx.ui.setWidget("tasks", (_tui: any, theme: any) => ({
-            invalidate() {},
-            // Full-width box, like the subagent widget (same ACCENT border).
-            render: (width: number) =>
-              render(width, {
-                strike: (t) => theme.strikethrough(t),
-                dim: (t) => theme.fg("dim", t),
-                accent: (t) => `${ACCENT}${t}${RST}`,
-                error: (t) => theme.fg("error", t),
-              }),
-          }));
+          taskRender = render;
+          mountTasksWidget();
+          if (runningSubagents.size > 0) updateWidget();
         },
         writeLabels: setTerminalLabels,
         parentTerminal: () => process.env.HC_TERMINAL_ID,
@@ -1666,8 +1751,23 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     } catch {}
   };
 
+  tasksCollapsed = loadTasksCollapsed();
+
+  // second-look emits `ui:widget-shown` when it shows a note. Re-mount below it. Subscribed per session.
+  let offWidgetShown: (() => void) | undefined;
+  const unsubscribeWidgetShown = () => {
+    try {
+      offWidgetShown?.();
+    } catch {}
+    offWidgetShown = undefined;
+  };
+
   pi.on("session_start", (_event, ctx) => {
     latestCtx = ctx;
+    unsubscribeWidgetShown();
+    try {
+      offWidgetShown = pi.events?.on("ui:widget-shown", () => remountTaskAndSubagentWidgets());
+    } catch {}
     rebuildTasks(ctx);
   });
 
@@ -1695,6 +1795,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
   // Clean up on session shutdown
   pi.on("session_shutdown", (event, _ctx) => {
+    unsubscribeWidgetShown();
     if (widgetInterval) {
       clearInterval(widgetInterval);
       widgetInterval = null;
@@ -1986,10 +2087,22 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       },
     });
 
+    const toggleTasks = () => {
+      setTasksCollapsed(!tasksCollapsed);
+      remountTaskAndSubagentWidgets();
+    };
+    pi.registerShortcut(TASKS_TOGGLE_KEY, {
+      description: "Collapse or expand the Tasks box",
+      handler: async () => toggleTasks(),
+    });
     pi.registerCommand("tasks", {
-      description: "Show the session task list",
-      handler: async (_args, ctx) => {
-        ctx.ui.notify(formatTaskList(controller.store), "info");
+      description: "Collapse or expand the Tasks box; /tasks list shows the full list",
+      handler: async (args, ctx) => {
+        if (args.trim() === "list" || controller.store.all().length === 0) {
+          ctx.ui.notify(formatTaskList(controller.store), "info");
+          return;
+        }
+        toggleTasks();
       },
     });
   }

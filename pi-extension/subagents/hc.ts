@@ -106,10 +106,13 @@ export function shellEscape(s: string): string {
 
 export const SETTINGS_KEY = "hc-subagents";
 const DEFAULT_MAX_SPLIT_CHILDREN = 4;
+export const DEFAULT_SPLIT_RATIO = 1 / 3;
 
 export interface LayoutSettings {
   layout: LayoutMode;
   maxSplitChildren: number;
+  /** Share of the width the child column takes (0.1..0.9). Unset = DEFAULT_SPLIT_RATIO. */
+  splitRatio?: number;
   /** Extension files/package dirs for lean children. Unset = children inherit everything. */
   childExtensions?: string[];
   /** Model used when neither the `model` param nor the agent frontmatter sets one. Format: "provider/id". */
@@ -125,6 +128,9 @@ export function parseLayoutSettings(raw: unknown): Partial<LayoutSettings> {
   if (r.layout === "split" || r.layout === "tab") out.layout = r.layout;
   if (typeof r.maxSplitChildren === "number" && Number.isInteger(r.maxSplitChildren) && r.maxSplitChildren >= 0) {
     out.maxSplitChildren = r.maxSplitChildren;
+  }
+  if (typeof r.splitRatio === "number" && Number.isFinite(r.splitRatio) && r.splitRatio >= 0.1 && r.splitRatio <= 0.9) {
+    out.splitRatio = r.splitRatio;
   }
   if (Array.isArray(r.childExtensions)) {
     out.childExtensions = r.childExtensions.filter((x): x is string => typeof x === "string" && x.trim() !== "");
@@ -210,6 +216,10 @@ export function setLayoutMode(mode: LayoutMode): void {
 
 export function getMaxSplitChildren(): number {
   return currentSettings().maxSplitChildren;
+}
+
+export function getSplitRatio(): number {
+  return currentSettings().splitRatio ?? DEFAULT_SPLIT_RATIO;
 }
 
 // ---------------------------------------------------------------------------
@@ -340,9 +350,25 @@ function createSplitChild(parent: TerminalLocation): string {
   const paneId = extractId(parsed?.pane);
   const terminalId = extractId(parsed?.terminal);
   if (!paneId || !terminalId) throw new Error(`Unexpected pane.split output: ${out.trim()}`);
+  if (!last) sizeChildColumn(parent.paneId, paneId);
   panes.set(terminalId, paneId);
   splitChildren.push(terminalId);
   return terminalId;
+}
+
+/**
+ * `herdr-app do pane.split` has no ratio argument and splits 50/50. Set the
+ * layout weights of the two panes instead: `layout.resize` takes a pane id and
+ * shares the width in proportion to the weights. The weights add up to 2, the
+ * default sum of two equal panes, so the pair keeps its share of the row.
+ * Best effort: a failed resize leaves the 50/50 split and does not fail the spawn.
+ */
+function sizeChildColumn(parentPane: string, childPane: string): void {
+  const ratio = getSplitRatio();
+  try {
+    herdrDo("layout.resize", ["--id", childPane, "--weight", String(2 * ratio)]);
+    herdrDo("layout.resize", ["--id", parentPane, "--weight", String(2 * (1 - ratio))]);
+  } catch {}
 }
 
 function createTabChild(parent: TerminalLocation): string {

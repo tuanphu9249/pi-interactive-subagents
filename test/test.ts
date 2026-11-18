@@ -29,6 +29,8 @@ import {
   getMuxBackend,
   setLayoutMode,
   parseLayoutSettings,
+  getSplitRatio,
+  DEFAULT_SPLIT_RATIO,
   __setHcSettings,
   applyProviderMap,
   resolveEffectiveModel,
@@ -2353,8 +2355,10 @@ describe("hc.ts Herdr backend", () => {
     const seq = doCalls().map((c) => c.args.slice(1));
     assert.deepEqual(seq[0], ["pane.split", "--direction", "right", "--pane", "pParent", "--argv", JSON.stringify(["/bin/bash", "--noprofile", "--norc"])]);
     assert.deepEqual(seq[1], ["pane.focus", "--pane", "pParent"]);
-    assert.deepEqual(seq[2].slice(0, 5), ["pane.split", "--direction", "down", "--pane", "p10"]);
-    assert.deepEqual(seq[3], ["pane.focus", "--pane", "pParent"]);
+    assert.deepEqual(seq[2].slice(0, 3), ["layout.resize", "--id", "p10"]);
+    assert.deepEqual(seq[3].slice(0, 3), ["layout.resize", "--id", "pParent"]);
+    assert.deepEqual(seq[4].slice(0, 5), ["pane.split", "--direction", "down", "--pane", "p10"]);
+    assert.deepEqual(seq[5], ["pane.focus", "--pane", "pParent"]);
 
     // focus call is the very next CLI call after each split
     const idx = calls.findIndex((c) => c.args[1] === "pane.split");
@@ -2487,6 +2491,77 @@ describe("hc.ts Herdr backend", () => {
     calls.length = 0;
     createSurface("again");
     assert.ok(doCalls().some((c) => c.args[1] === "pane.split" && c.args.includes("p12")));
+  });
+
+  describe("splitRatio", () => {
+    const resizes = () => doCalls().filter((c) => c.args[1] === "layout.resize").map((c) => c.args.slice(1));
+
+    it("defaults to 1/3 and sizes the child column after the first (right) split only", () => {
+      assert.equal(getSplitRatio(), DEFAULT_SPLIT_RATIO);
+      createSurface("a");
+      createSurface("b");
+      createSurface("c");
+      assert.deepEqual(resizes(), [
+        ["layout.resize", "--id", "p10", "--weight", String(2 / 3)],
+        ["layout.resize", "--id", "pParent", "--weight", String(2 * (1 - 1 / 3))],
+      ]);
+      // pane.split never gets a ratio argument: herdr-app rejects unknown arguments
+      const splits = doCalls().filter((c) => c.args[1] === "pane.split");
+      assert.equal(splits.length, 3);
+      assert.ok(splits.every((c) => !c.args.includes("--ratio")));
+      // resize comes after the split and its focus restore, so focus stays the very next call
+      const idx = calls.findIndex((c) => c.args[1] === "pane.split");
+      assert.equal(calls[idx + 1].args[1], "pane.focus");
+      assert.equal(calls[idx + 2].args[1], "layout.resize");
+    });
+
+    it("uses the configured ratio; the weights add up to 2", () => {
+      __setHcSettings({ splitRatio: 0.25 });
+      assert.equal(getSplitRatio(), 0.25);
+      createSurface("a");
+      assert.deepEqual(resizes(), [
+        ["layout.resize", "--id", "p10", "--weight", "0.5"],
+        ["layout.resize", "--id", "pParent", "--weight", "1.5"],
+      ]);
+    });
+
+    it("does not resize in tab mode", () => {
+      setLayoutMode("tab");
+      createSurface("a");
+      assert.deepEqual(resizes(), []);
+    });
+
+    it("keeps the spawn when layout.resize fails", () => {
+      __setHcExec({
+        async: async () => "",
+        sync(file, args) {
+          calls.push({ file, args });
+          if (file === "herdr-app" && args[0] === "ls") return JSON.stringify(topology());
+          if (file === "herdr-app" && args[1] === "layout.resize") throw new Error("boom");
+          if (file === "herdr-app" && args[1] === "pane.split") {
+            const n = nextTerminal++;
+            extraTerminals.push({ terminal: `t${n}`, pane: `p${n}`, tab: "tabParent" });
+            return JSON.stringify({ pane: `p${n}`, terminal: `t${n}` });
+          }
+          return "";
+        },
+      });
+      assert.equal(createSurface("a"), "t10");
+    });
+
+    it("accepts 0.1..0.9 and ignores anything else", () => {
+      assert.deepEqual(parseLayoutSettings({ splitRatio: 0.5 }), { splitRatio: 0.5 });
+      assert.deepEqual(parseLayoutSettings({ splitRatio: 0.1 }), { splitRatio: 0.1 });
+      assert.deepEqual(parseLayoutSettings({ splitRatio: 0.9 }), { splitRatio: 0.9 });
+      for (const bad of [0.05, 0.95, 0, 1, -0.3, NaN, Infinity, "0.5", null, [0.5]]) {
+        assert.deepEqual(parseLayoutSettings({ splitRatio: bad }), {}, `splitRatio ${String(bad)}`);
+      }
+    });
+
+    it("an invalid setting falls back to the default", () => {
+      __setHcSettings(parseLayoutSettings({ splitRatio: 5 }));
+      assert.equal(getSplitRatio(), DEFAULT_SPLIT_RATIO);
+    });
   });
 
   it("parses layout settings", () => {

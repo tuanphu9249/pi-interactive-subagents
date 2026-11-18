@@ -33,14 +33,16 @@ Backend: Herdr Core only. Run pi inside the Herdr app (`HC_TERMINAL_ID` set; `hc
 
 Layout (new children only):
 
-- `split` (default): children stack in one column to the right of the parent pane. After `maxSplitChildren` (default 4) live children, new ones go to the tab.
+- `split` (default): children stack in one column to the right of the parent pane. The child column takes `splitRatio` of the width (default `1/3`; the parent keeps the rest). After `maxSplitChildren` (default 4) live children, new ones go to the tab.
 - `tab`: children go into one shared tab named "Subagents" in the parent's space.
 
 Herdr moves focus to a new split pane; the extension returns focus right after each split to the pane you had focused (read from `herdr-app status`, so it works across workspaces). If nothing was focused, it does not refocus. If status fails, it refocuses the parent pane. Set defaults in `~/.pi/agent/settings.json` (or project `.pi/settings.json`):
 
 ```json
-{ "hc-subagents": { "layout": "split", "maxSplitChildren": 4 } }
+{ "hc-subagents": { "layout": "split", "maxSplitChildren": 4, "splitRatio": 0.33 } }
 ```
+
+`splitRatio` is a number from `0.1` to `0.9`: the share of the width the child column takes. Other values are ignored and the default `1/3` applies. `herdr-app do pane.split` has no ratio argument, so after the first (right) split the extension sets the layout weights of the parent pane and the new pane with `layout.resize`. Later children split `down` inside the child column and stack evenly. If the resize fails, the split stays 50/50. It applies to new children only.
 
 Change the layout for the rest of the session with `/subagents layout split|tab` (no argument shows the current layout). Each child terminal gets `hc` labels: `pi.subagent`, `pi.role`, `pi.name`, `pi.parent`, `pi.task`, `pi.started`, `pi.activity`, and with `taskId` also `pi.taskid`, `pi.tasksubject` (see [Terminal labels](#terminal-labels)).
 

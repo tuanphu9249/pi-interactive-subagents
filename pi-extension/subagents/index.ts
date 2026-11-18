@@ -1647,12 +1647,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           }
           latestCtx.ui.setWidget("tasks", (_tui: any, theme: any) => ({
             invalidate() {},
-            // Same 1-column padding as Pi's plain string[] widgets; one row per task, cut to width.
+            // Full-width box, like the subagent widget (same ACCENT border).
             render: (width: number) =>
-              render({
+              render(width, {
                 strike: (t) => theme.strikethrough(t),
                 dim: (t) => theme.fg("dim", t),
-              }).map((line) => ` ${truncateToWidth(line, Math.max(1, width - 2))}`),
+                accent: (t) => `${ACCENT}${t}${RST}`,
+                error: (t) => theme.fg("error", t),
+              }),
           }));
         },
         writeLabels: setTerminalLabels,

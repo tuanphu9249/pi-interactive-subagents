@@ -66,7 +66,7 @@ import {
   findLatestAssistantError,
 } from "../pi-extension/subagents/subagent-done.ts";
 import { __pollForExitTest__ } from "../pi-extension/subagents/hc.ts";
-import { shouldRemindAboutTasks, renderTaskWidgetLines, TaskStore } from "../pi-extension/subagents/tasks.ts";
+import { shouldRemindAboutTasks, renderTaskWidgetLines, renderTaskWidgetBox, TASK_BOX_MIN_WIDTH, TaskStore } from "../pi-extension/subagents/tasks.ts";
 
 // --- Helpers ---
 
@@ -2909,6 +2909,9 @@ describe("task tool", () => {
   const labelCalls = () => calls.filter((c) => c.file === "hc" && c.args[0] === "label");
   const lastLabel = () => labelCalls().at(-1)?.args.slice(2);
 
+  /** Row texts of a plain-text task box: strip `│ ` and ` │`, trim padding. */
+  const boxRows = (lines: string[]) => lines.slice(1, -1).map((l) => l.replace(/^│ /, "").replace(/ *│$/, ""));
+
   /** Load the extension with a fake Pi that records handlers, tools and custom entries. */
   function setup(branch: any[] = []) {
     const handlers: Record<string, Function> = {};
@@ -2936,7 +2939,7 @@ describe("task tool", () => {
             typeof c === "function"
               ? c({}, { strikethrough: (t: string) => `~${t}~`, fg: (_n: string, t: string) => t })
                   .render(80)
-                  .map((l: string) => l.replace(/^ /, "")) // the 1-column widget padding
+                  .map((l: string) => l.replace(/\x1b\[[0-9;]*m/g, "")) // plain text; colours are tested on renderTaskWidgetBox
               : c,
           ), notify: (m: string) => notes.push(m) },
       sessionManager: { getBranch: () => state.branch },
@@ -3246,8 +3249,11 @@ describe("task tool", () => {
       await run({ action: "update", id: "4", status: "in_progress", activeForm: "Doing it" });
       await run({ action: "create", subject: "Done" });
       await run({ action: "update", id: "5", status: "completed" });
-      assert.deepEqual(widgets.at(-1), [
-        "Tasks 1/5",
+      const lines = widgets.at(-1)!;
+      assert.equal(lines.length, 7); // 5 rows + 2 borders
+      assert.ok(lines.every((l) => visibleWidth(l) === 80));
+      assert.match(lines[0], /^╭─ Tasks ─+ 1\/5 done ─╮$/);
+      assert.deepEqual(boxRows(lines), [
         "○ #1 Blocker",
         "· #2 Waits (blocked by #1)",
         "○ #3 Free",
@@ -3256,14 +3262,14 @@ describe("task tool", () => {
       ]);
     });
 
-    it("widget never exceeds 7 lines", async () => {
+    it("widget never exceeds 9 lines (7 rows + borders)", async () => {
       const { run, widgets, handlers, ctx } = setup();
       handlers.session_start({ reason: "startup" }, ctx);
-      for (let i = 1; i <= 9; i++) await run({ action: "create", subject: `T${i}` });
+      for (let i = 1; i <= 12; i++) await run({ action: "create", subject: `T${i}` });
       const lines = widgets.at(-1)!;
-      assert.equal(lines.length, 7);
-      assert.equal(lines[0], "Tasks 0/9");
-      assert.match(lines[6], /\+4 more/);
+      assert.equal(lines.length, 9);
+      assert.match(lines[0], /0\/12 done/);
+      assert.match(boxRows(lines).at(-1)!, /\+6 more/);
     });
 
     describe("renderTaskWidgetLines", () => {
@@ -3276,50 +3282,155 @@ describe("task tool", () => {
         return store;
       };
       const style = { strike: (t: string) => `~${t}~` };
+      // Markers so tests can assert colours without ANSI.
+      const marks = {
+        strike: (t: string) => `~${t}~`,
+        dim: (t: string) => `<dim>${t}</dim>`,
+        accent: (t: string) => `<acc>${t}</acc>`,
+        error: (t: string) => `<err>${t}</err>`,
+      };
+      const sample = () =>
+        build([
+          ["Setup", "completed"], ["Build", "in_progress"], ["Test"],
+          ["Ship", undefined, ["3"]], ["Lint", "failed"],
+        ]);
 
-      it("3 done, 1 doing, 2 ready, 1 blocked: drops oldest done into one line when short", () => {
+      it("3 done, 1 doing, 2 ready, 1 blocked: drops oldest done into one row when short", () => {
         const store = build([
           ["a", "completed"], ["b", "completed"], ["c", "completed"],
           ["d", "in_progress"], ["e"], ["f"], ["g", undefined, ["5"]],
         ]);
-        assert.deepEqual(renderTaskWidgetLines(store, 8, style), [
-          "Tasks 3/7",
+        assert.deepEqual(renderTaskWidgetLines(store, 7, style), [
           "✓ ~#1 a~", "✓ ~#2 b~", "✓ ~#3 c~",
           "▶ #4 d", "○ #5 e", "○ #6 f", "· #7 g (blocked by #5)",
         ]);
-        assert.deepEqual(renderTaskWidgetLines(store, 6, style), [
-          "Tasks 3/7", "✓ 3 done", "▶ #4 d", "○ #5 e", "○ #6 f", "· #7 g (blocked by #5)",
+        assert.deepEqual(renderTaskWidgetLines(store, 5, style), [
+          "✓ 3 done", "▶ #4 d", "○ #5 e", "○ #6 f", "· #7 g (blocked by #5)",
         ]);
-        assert.deepEqual(renderTaskWidgetLines(store, 7, style), [
-          "Tasks 3/7", "✓ 2 done", "✓ ~#3 c~", "▶ #4 d", "○ #5 e", "○ #6 f", "· #7 g (blocked by #5)",
+        assert.deepEqual(renderTaskWidgetLines(store, 6, style), [
+          "✓ 2 done", "✓ ~#3 c~", "▶ #4 d", "○ #5 e", "○ #6 f", "· #7 g (blocked by #5)",
         ]);
       });
 
       it("failed shows ✗ unstruck; cancelled hidden; open overflow keeps +N more", () => {
         const store = build([["a", "failed"], ["b", "cancelled"], ["c", "completed"]]);
-        assert.deepEqual(renderTaskWidgetLines(store, 6, style), ["Tasks 1/2", "✗ #1 a", "✓ ~#3 c~"]);
+        assert.deepEqual(renderTaskWidgetLines(store, 5, style), ["✗ #1 a", "✓ ~#3 c~"]);
         const many = build(Array.from({ length: 8 }, (_, i) => [`t${i}`] as [string]));
-        const lines = renderTaskWidgetLines(many, 6)!;
-        assert.equal(lines.length, 6);
-        assert.match(lines[5], /… \+4 more/);
+        const lines = renderTaskWidgetLines(many, 5)!;
+        assert.equal(lines.length, 5);
+        assert.match(lines[4], /… \+4 more/);
       });
 
-      it("open tasks fill the room exactly: no done line, never over maxLines", () => {
+      it("open tasks fill the room exactly: no done row, never over maxLines", () => {
         const store = build([
           ["a", "completed"], ["b", "completed"],
           ["c"], ["d"], ["e"], ["f"], ["g"], ["h"],
         ]);
-        assert.deepEqual(renderTaskWidgetLines(store, 7, style), [
-          "Tasks 2/8", "○ #3 c", "○ #4 d", "○ #5 e", "○ #6 f", "○ #7 g", "○ #8 h",
+        assert.deepEqual(renderTaskWidgetLines(store, 6, style), [
+          "○ #3 c", "○ #4 d", "○ #5 e", "○ #6 f", "○ #7 g", "○ #8 h",
         ]);
-        for (let max = 1; max <= 9; max++) {
+        for (let max = 0; max <= 9; max++) {
           assert.ok(renderTaskWidgetLines(store, max)!.length <= max, `maxLines ${max}`);
         }
       });
 
-      it("identity default style: plain text", () => {
-        const store = build([["a", "completed"]]);
-        assert.deepEqual(renderTaskWidgetLines(store), ["Tasks 1/1", "✓ #1 a"]);
+      it("identity default style: plain text; empty store gives undefined", () => {
+        assert.deepEqual(renderTaskWidgetLines(build([["a", "completed"]])), ["✓ #1 a"]);
+        assert.equal(renderTaskWidgetLines(new TaskStore()), undefined);
+        assert.equal(renderTaskWidgetBox(new TaskStore(), 60), undefined);
+      });
+
+      it("applies colours per status through the injected style", () => {
+        assert.deepEqual(renderTaskWidgetLines(sample(), 7, marks), [
+          "<dim>✓ ~#1 Setup~</dim>",
+          "<acc>▶ #2 Build</acc>",
+          "○ #3 Test",
+          "<dim>· #4 Ship (blocked by #3)</dim>",
+          "<err>✗ #5 Lint</err>",
+        ]);
+      });
+
+      it("box: border shape and exact width at several widths", () => {
+        for (const width of [24, 30, 60, 100]) {
+          const lines = renderTaskWidgetBox(sample(), width)!;
+          assert.equal(lines.length, 7, `height at ${width}`); // 5 rows + 2 borders
+          for (const l of lines) assert.equal(visibleWidth(l), width, `width ${width}: ${l}`);
+          assert.match(lines[0], /^╭─ Tasks ─* 1\/5 done ─╮$/);
+          assert.match(lines.at(-1)!, /^╰─+╯$/);
+          for (const l of lines.slice(1, -1)) assert.match(l, /^│ .* │$/);
+        }
+      });
+
+      it("box: rows are cut to the width, borders stay aligned", () => {
+        const store = build([["x".repeat(200), "in_progress"]]);
+        const lines = renderTaskWidgetBox(store, 40)!;
+        assert.equal(lines.length, 3);
+        for (const l of lines) assert.equal(visibleWidth(l), 40);
+        assert.match(lines[1].replace(/\x1b\[[0-9;]*m/g, ""), /^│ ▶ #1 x+\.\.\. │$/);
+      });
+
+      it("box: border and ▶ use accent, ✗ error, completed dim and struck; border chars are coloured", () => {
+        const lines = renderTaskWidgetBox(sample(), 60, marks)!;
+        assert.ok(lines[0].startsWith("<acc>╭") && lines[0].endsWith("╮</acc>"));
+        assert.ok(lines.at(-1)!.startsWith("<acc>╰") && lines.at(-1)!.endsWith("╯</acc>"));
+        assert.ok(lines[1].startsWith("<acc>│</acc> <dim>✓ ~#1 Setup~</dim>"));
+        assert.ok(lines[1].endsWith(" <acc>│</acc>"));
+        assert.match(lines[2], /<acc>▶ #2 Build<\/acc>/);
+        assert.match(lines[3], /^<acc>│<\/acc> ○ #3 Test +<acc>│<\/acc>$/);
+        assert.match(lines[4], /<dim>· #4 Ship \(blocked by #3\)<\/dim>/);
+        assert.match(lines[5], /<err>✗ #5 Lint<\/err>/);
+      });
+
+      it("box: row colours do not change the width", () => {
+        const plain = renderTaskWidgetBox(sample(), 60)!;
+        const coloured = renderTaskWidgetBox(sample(), 60, {
+          strike: (t) => `\x1b[9m${t}\x1b[29m`,
+          dim: (t) => `\x1b[2m${t}\x1b[22m`,
+          accent: (t) => `\x1b[38;2;77;163;255m${t}\x1b[0m`,
+          error: (t) => `\x1b[31m${t}\x1b[39m`,
+        })!;
+        assert.deepEqual(coloured.map((l) => visibleWidth(l)), plain.map((l) => visibleWidth(l)));
+      });
+
+      it("box: the ✓ N done fold appears inside the box when room is short; info counts all", () => {
+        const store = build([
+          ["a", "completed"], ["b", "completed"], ["c", "completed"],
+          ["d", "in_progress"], ["e"], ["f"], ["g", undefined, ["5"]],
+        ]);
+        const lines = renderTaskWidgetBox(store, 60, {}, 5)!;
+        assert.match(lines[0], /3\/7 done/);
+        assert.deepEqual(boxRows(lines), [
+          "✓ 3 done", "▶ #4 d", "○ #5 e", "○ #6 f", "· #7 g (blocked by #5)",
+        ]);
+        assert.equal(lines.length, 7);
+      });
+
+      it("box: at most maxLines rows plus 2 borders (default 9 lines)", () => {
+        const many = build(Array.from({ length: 20 }, (_, i) => [`t${i}`] as [string]));
+        assert.equal(renderTaskWidgetBox(many, 60)!.length, 9);
+        assert.equal(renderTaskWidgetBox(many, 60, {}, 3)!.length, 5);
+      });
+
+      it("box: cancelled tasks are hidden and not counted", () => {
+        const store = build([["a", "cancelled"], ["b", "completed"]]);
+        const lines = renderTaskWidgetBox(store, 60)!;
+        assert.match(lines[0], /1\/1 done/);
+        assert.deepEqual(boxRows(lines), ["✓ #2 b"]);
+      });
+
+      it("narrow terminal: unboxed lines cut to the width", () => {
+        const width = TASK_BOX_MIN_WIDTH - 1;
+        const lines = renderTaskWidgetBox(sample(), width)!;
+        assert.equal(lines[0], "Tasks 1/5");
+        assert.equal(lines.length, 6);
+        assert.ok(!lines.some((l) => /[╭╮╰╯│]/.test(l)));
+        for (const l of lines) assert.ok(visibleWidth(l) <= width, l);
+        assert.deepEqual(renderTaskWidgetBox(sample(), 0), []);
+        for (const w of [1, 2, 5]) {
+          for (const l of renderTaskWidgetBox(sample(), w)!) assert.ok(visibleWidth(l) <= w);
+        }
+        // exactly the minimum width still boxes
+        assert.match(renderTaskWidgetBox(sample(), TASK_BOX_MIN_WIDTH)![0], /^╭.*╮$/);
       });
     });
 

@@ -11,6 +11,8 @@
  * from the last snapshot on the current branch.
  */
 
+import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+
 export const TASK_STATUSES = ["pending", "in_progress", "completed", "failed", "cancelled"] as const;
 export type TaskStatus = (typeof TASK_STATUSES)[number];
 
@@ -220,42 +222,43 @@ export function formatTaskList(store: TaskStore): string {
 export interface TaskWidgetStyle {
   /** Strike text through. Default: identity. */
   strike?: (text: string) => string;
-  /** Dim a whole line (used for completed tasks). Default: identity. */
+  /** Dim a whole row (completed, blocked, fold). Default: identity. */
   dim?: (text: string) => string;
+  /** Accent colour: box border and in-progress rows. Default: identity. */
+  accent?: (text: string) => string;
+  /** Error colour: failed rows. Default: identity. */
+  error?: (text: string) => string;
 }
 
-/**
- * Widget lines: `Tasks 3/7`, then tasks in id order (checklist):
- * ✓ completed (struck, dim), ▶ in_progress, ○ ready, · blocked, ✗ failed. Cancelled tasks are hidden.
- * At most `maxLines` in all. Open tasks (not completed) always win room. If room is short,
- * the oldest completed tasks drop first and one `✓ N done` line replaces them.
- * If open tasks alone overflow, show the first ones (in_progress, failed, ready, blocked) and `… +N more`.
- */
-export function renderTaskWidgetLines(
+/** Narrowest width that still fits the top border `╭─ Tasks ─ N/M done ─╮`; below it the widget is unboxed. */
+export const TASK_BOX_MIN_WIDTH = 24;
+
+function rowsFor(
   store: TaskStore,
-  maxLines = 7,
-  style: TaskWidgetStyle = {},
-): string[] | undefined {
+  maxLines: number,
+  style: TaskWidgetStyle,
+): { rows: string[]; completed: number; total: number } | undefined {
   const strike = style.strike ?? ((t: string) => t);
   const dim = style.dim ?? ((t: string) => t);
+  const accent = style.accent ?? ((t: string) => t);
+  const error = style.error ?? ((t: string) => t);
   if (store.all().length === 0) return undefined;
   const tasks = store.all().filter((t) => t.status !== "cancelled");
   const { completed, total } = countTasks(store.all());
-  const header = `Tasks ${completed}/${total}`;
-  const room = Math.max(0, maxLines - 1);
+  const room = Math.max(0, maxLines);
 
   const rowFor = (t: Task): string => {
     switch (t.status) {
       case "completed":
         return dim(`✓ ${strike(`#${t.id} ${t.subject}`)}`);
       case "in_progress":
-        return `▶ #${t.id} ${t.activeForm || t.subject}${t.owner ? ` (${t.owner})` : ""}`;
+        return accent(`▶ #${t.id} ${t.activeForm || t.subject}${t.owner ? ` (${t.owner})` : ""}`);
       case "failed":
-        return `✗ #${t.id} ${t.subject}`;
+        return error(`✗ #${t.id} ${t.subject}`);
       default:
         return store.isReady(t)
           ? `○ #${t.id} ${t.subject}`
-          : `· #${t.id} ${t.subject} (blocked by ${t.blockedBy.map((b) => `#${b}`).join(",")})`;
+          : dim(`· #${t.id} ${t.subject} (blocked by ${t.blockedBy.map((b) => `#${b}`).join(",")})`);
     }
   };
 
@@ -267,7 +270,8 @@ export function renderTaskWidgetLines(
       t.status === "in_progress" ? 0 : t.status === "failed" ? 1 : store.isReady(t) ? 2 : 3;
     const ordered = [...open].sort((a, b) => rank(a) - rank(b));
     const shown = ordered.slice(0, Math.max(0, room - 1)).map(rowFor);
-    return [header, ...shown, `… +${open.length - shown.length} more`].slice(0, Math.max(1, maxLines));
+    const rows = [...shown, `… +${open.length - shown.length} more`].slice(0, room);
+    return { rows, completed, total };
   }
 
   const slots = room - open.length;
@@ -280,9 +284,66 @@ export function renderTaskWidgetLines(
   }
   const keepIds = new Set([...keep, ...open].map((t) => t.id));
   const rows = tasks.filter((t) => keepIds.has(t.id)).map(rowFor);
-  // No free row (open tasks fill the room): drop the `✓ N done` line too; the header still counts them.
+  // No free row (open tasks fill the room): drop the `✓ N done` line too; the box info still counts them.
   const doneLine = dropped > 0 && slots > 0 ? [dim(`✓ ${dropped} done`)] : [];
-  return [header, ...doneLine, ...rows];
+  return { rows: [...doneLine, ...rows], completed, total };
+}
+
+/**
+ * Task rows (no header), in id order (checklist):
+ * ✓ completed (struck, dim), ▶ in_progress (accent), ○ ready, · blocked (dim), ✗ failed (error). Cancelled tasks are hidden.
+ * At most `maxLines` rows. Open tasks (not completed) always win room. If room is short,
+ * the oldest completed tasks drop first and one `✓ N done` row replaces them.
+ * If open tasks alone overflow, show the first ones (in_progress, failed, ready, blocked) and `… +N more`.
+ * Returns undefined when the store is empty.
+ */
+export function renderTaskWidgetLines(
+  store: TaskStore,
+  maxLines = 7,
+  style: TaskWidgetStyle = {},
+): string[] | undefined {
+  return rowsFor(store, maxLines, style)?.rows;
+}
+
+/**
+ * Task widget as a box like the subagent widget:
+ *   ╭─ Tasks ──────── 3/7 done ─╮
+ *   │ ✓ #1 a                    │
+ *   ╰───────────────────────────╯
+ * Border in the accent colour; rows cut and padded to `width`. The box has at most `maxLines` rows
+ * plus two borders. Below TASK_BOX_MIN_WIDTH the widget is unboxed: a `Tasks N/M` line, then the rows,
+ * each cut to `width`. Returns undefined when the store is empty.
+ */
+export function renderTaskWidgetBox(
+  store: TaskStore,
+  width: number,
+  style: TaskWidgetStyle = {},
+  maxLines = 7,
+): string[] | undefined {
+  const res = rowsFor(store, maxLines, style);
+  if (!res) return undefined;
+  if (width <= 0) return [];
+  const accent = style.accent ?? ((t: string) => t);
+  const { rows, completed, total } = res;
+
+  if (width < TASK_BOX_MIN_WIDTH) {
+    return [`Tasks ${completed}/${total}`, ...rows].map((l, i) =>
+      truncateToWidth(i === 0 ? accent(l) : l, width),
+    );
+  }
+
+  const inner = width - 2;
+  const titlePart = "─ Tasks ";
+  const infoPart = ` ${completed}/${total} done ─`;
+  const fill = "─".repeat(Math.max(0, inner - titlePart.length - infoPart.length));
+  const bar = accent("│");
+  const lines = [accent(`╭${titlePart}${fill}${infoPart}╮`)];
+  for (const row of rows) {
+    const cut = truncateToWidth(row, inner - 2);
+    lines.push(`${bar} ${cut}${" ".repeat(Math.max(0, inner - 2 - visibleWidth(cut)))} ${bar}`);
+  }
+  lines.push(accent(`╰${"─".repeat(inner)}╯`));
+  return lines;
 }
 
 /** Labels for the parent terminal. Empty string means: remove the label. */
@@ -333,7 +394,7 @@ export interface TaskControllerDeps {
   /** Persist a snapshot as a session custom entry. */
   appendEntry?: (customType: string, data: unknown) => void;
   /** Set or clear (undefined) the widget above the editor. */
-  setWidget?: (render: ((style: TaskWidgetStyle) => string[]) | undefined) => void;
+  setWidget?: (render: ((width: number, style: TaskWidgetStyle) => string[]) | undefined) => void;
   /** Write labels on a terminal. Empty value removes the label. May throw. */
   writeLabels?: (terminalId: string, labels: Record<string, string>) => void;
   /** Parent terminal id (`$HC_TERMINAL_ID`). */
@@ -372,7 +433,7 @@ export class TaskController {
     try {
       const has = this.store.all().length > 0;
       this.deps.setWidget?.(
-        has ? (style) => renderTaskWidgetLines(this.store, 7, style) ?? [] : undefined,
+        has ? (width, style) => renderTaskWidgetBox(this.store, width, style) ?? [] : undefined,
       );
     } catch {}
     this.writeParentLabels();

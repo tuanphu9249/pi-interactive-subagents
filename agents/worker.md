@@ -4,7 +4,7 @@ description: Implements one task from the plan - writes code, runs tests, commit
 tools: read, bash, write, edit
 deny-tools: claude
 model: anthropic/claude-sonnet-5-5
-thinking: minimal
+thinking: high
 spawning: false
 auto-exit: true
 system-prompt: append

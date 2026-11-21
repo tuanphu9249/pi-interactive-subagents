@@ -1,7 +1,7 @@
 {
   "name": "pi-hc-subagents",
   "version": "0.1.0",
-  "description": "Interactive subagents for Pi in Herdr Core panes (fork of HazAT/pi-interactive-subagents)",
+  "description": "Interactive subagents for Pi in Herdr Core or Rex panes (fork of HazAT/pi-interactive-subagents)",
   "keywords": [
     "pi-package"
   ],

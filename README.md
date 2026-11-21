@@ -29,7 +29,9 @@ subagent({ name: "Scout: DB", agent: "scout", task: "Map database schema" });
 pi install git:github.com/HazAT/pi-interactive-subagents
 ```
 
-Backend: Herdr Core only. Run pi inside the Herdr app (`HC_TERMINAL_ID` set; `hc` and `herdr-app` on PATH). Each subagent is a Herdr terminal shown as a pane.
+Backends: Herdr Core and Rex. Run pi inside the Herdr app (`HC_TERMINAL_ID` set; `hc` and `herdr-app` on PATH). Each subagent is a Herdr terminal shown as a pane.
+
+Rex: run pi inside Rex (`REX_SESSION` and `REX_BLOCK` set; `rex` on PATH, and `HC_TERMINAL_ID` not set). Each subagent is a Rex terminal block. The first child splits right of the parent with `splitRatio`, later children split below the last one; new blocks do not take focus (`--focus=false`). Past `maxSplitChildren`, or with `layout: "tab"`, children go to a `Subagents` tab. Rex blocks carry one text label (the subagent name), so the Herdr `pi.*` key=value labels are not written. Inside Herdr, the Herdr backend always wins.
 
 Layout (new children only):
 
@@ -567,6 +569,7 @@ Every sub-agent session displays a compact tools widget showing available and de
 
 - [pi](https://github.com/badlogic/pi-mono) — the coding agent
 - [Herdr](https://herdr.dev) app with Herdr Core (`hc`, `herdr-app`); run pi inside it
+- or [Rex](https://www.superlogical.com/rex) (`rex`); run pi inside it
 
 ---
 

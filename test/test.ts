@@ -34,7 +34,12 @@ import {
   __setHcSettings,
   applyProviderMap,
   resolveEffectiveModel,
+  getSplitChildCount,
+  setTerminalLabels,
+  readScreenAsync,
+  muxSetupHint,
 } from "../pi-extension/subagents/hc.ts";
+import { lastLines } from "../pi-extension/subagents/rex.ts";
 import { resolveChildExtensions, parseExtensionsField } from "../pi-extension/subagents/child-extensions.ts";
 import {
   advanceStatusState,
@@ -246,6 +251,12 @@ const TOOL_RESULT = {
 };
 
 // --- Tests ---
+
+
+// Tests run with Herdr in mind unless a suite says otherwise. When they run inside Rex,
+// REX_* would select the Rex backend wherever HC_TERMINAL_ID is unset.
+delete process.env.REX_SESSION;
+delete process.env.REX_BLOCK;
 
 describe("session.ts", () => {
   let dir: string;
@@ -2273,7 +2284,12 @@ describe("hc.ts shellEscape", () => {
 
 describe("hc.ts Herdr backend", () => {
   type Call = { file: string; args: string[] };
-  const savedEnv = { id: process.env.HC_TERMINAL_ID, path: process.env.PATH };
+  const savedEnv = {
+    id: process.env.HC_TERMINAL_ID,
+    path: process.env.PATH,
+    rexSession: process.env.REX_SESSION,
+    rexBlock: process.env.REX_BLOCK,
+  };
   let calls: Call[];
   let binDir: string;
   let nextTerminal: number;
@@ -2311,6 +2327,9 @@ describe("hc.ts Herdr backend", () => {
     extraTerminals = [];
     __resetHcState();
     process.env.HC_TERMINAL_ID = "t1";
+    // The suite may run inside Rex: without HC_TERMINAL_ID the Rex backend would be picked.
+    delete process.env.REX_SESSION;
+    delete process.env.REX_BLOCK;
     process.env.PATH = `${binDir}:${savedEnv.path}`;
     __setHcExec({
       async: async () => "",
@@ -2340,6 +2359,10 @@ describe("hc.ts Herdr backend", () => {
     __setHcExec(null);
     if (savedEnv.id === undefined) delete process.env.HC_TERMINAL_ID;
     else process.env.HC_TERMINAL_ID = savedEnv.id;
+    if (savedEnv.rexSession === undefined) delete process.env.REX_SESSION;
+    else process.env.REX_SESSION = savedEnv.rexSession;
+    if (savedEnv.rexBlock === undefined) delete process.env.REX_BLOCK;
+    else process.env.REX_BLOCK = savedEnv.rexBlock;
     process.env.PATH = savedEnv.path;
   });
 
@@ -2586,8 +2609,16 @@ describe("lean child extensions", () => {
   let dir: string;
   let calls: { file: string; args: string[] }[];
 
+  // closeSurface and session_shutdown need the Herdr backend: fake it, so the suite passes outside Herdr too.
+  const savedHerdrEnv = { id: process.env.HC_TERMINAL_ID, path: process.env.PATH };
+  let fakeBin: string;
+
   beforeEach(() => {
     dir = mkdtempSync(join(tmpdir(), "lean-"));
+    fakeBin = mkdtempSync(join(tmpdir(), "lean-bin-"));
+    for (const name of ["hc", "herdr-app"]) writeFileSync(join(fakeBin, name), "#!/bin/sh\n", { mode: 0o755 });
+    process.env.HC_TERMINAL_ID = "t1";
+    process.env.PATH = `${fakeBin}:${savedHerdrEnv.path}`;
     calls = [];
     __resetHcState();
     __setHcExec({
@@ -2600,6 +2631,10 @@ describe("lean child extensions", () => {
   });
   afterEach(() => {
     __setHcExec(null);
+    if (savedHerdrEnv.id === undefined) delete process.env.HC_TERMINAL_ID;
+    else process.env.HC_TERMINAL_ID = savedHerdrEnv.id;
+    process.env.PATH = savedHerdrEnv.path;
+    rmSync(fakeBin, { recursive: true, force: true });
     __resetHcState();
     rmSync(dir, { recursive: true, force: true });
   });
@@ -3807,5 +3842,157 @@ describe("task tool", () => {
       assert.equal(s.tool, undefined);
       assert.equal(s.handlers.before_agent_start ? fire(s) : undefined, undefined);
     });
+  });
+});
+
+describe("hc.ts Rex backend", () => {
+  type Call = { file: string; args: string[] };
+  const saved = {
+    id: process.env.HC_TERMINAL_ID,
+    path: process.env.PATH,
+    session: process.env.REX_SESSION,
+    block: process.env.REX_BLOCK,
+  };
+  const S = "session:s1";
+  const PARENT = "block:parent";
+  let calls: Call[];
+  let binDir: string;
+  let next: number;
+  let live: Set<string>;
+  let screen: string;
+
+  const restore = (key: string, value: string | undefined) => {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  };
+
+  before(() => {
+    binDir = mkdtempSync(join(tmpdir(), "rex-bin-"));
+    writeFileSync(join(binDir, "rex"), "#!/bin/sh\n", { mode: 0o755 });
+  });
+  after(() => {
+    rmSync(binDir, { recursive: true, force: true });
+  });
+
+  beforeEach(() => {
+    calls = [];
+    next = 1;
+    live = new Set([PARENT]);
+    screen = "line1\nline2\nline3\n\n";
+    __resetHcState();
+    __setHcSettings({ layout: "split", maxSplitChildren: 2, splitRatio: 0.3 });
+    delete process.env.HC_TERMINAL_ID;
+    process.env.REX_SESSION = S;
+    process.env.REX_BLOCK = PARENT;
+    process.env.PATH = `${binDir}:/usr/bin:/bin`;
+    const reply = (args: string[]): string => {
+      if (args[0] === "split" || (args[0] === "window" && args[1] === "new")) {
+        const id = `block:c${next++}`;
+        live.add(id);
+        return JSON.stringify({ block_ids: [id], ...(args[0] === "window" ? { window_id: "window:w1" } : {}) });
+      }
+      if (args[0] === "block" && args[1] === "ls") {
+        return JSON.stringify({ blocks: [...live].map((block_id) => ({ block_id })) });
+      }
+      if (args[0] === "capture") return screen;
+      return "";
+    };
+    __setHcExec({
+      async: async (file, args) => {
+        calls.push({ file, args });
+        return reply(args);
+      },
+      sync(file, args) {
+        calls.push({ file, args });
+        return reply(args);
+      },
+    });
+  });
+
+  afterEach(() => {
+    __setHcExec(null);
+    restore("HC_TERMINAL_ID", saved.id);
+    restore("REX_SESSION", saved.session);
+    restore("REX_BLOCK", saved.block);
+    process.env.PATH = saved.path;
+  });
+
+  const rexCalls = () => calls.filter((c) => c.file === "rex").map((c) => c.args);
+
+  it("picks Rex only without HC_TERMINAL_ID, with REX_SESSION, REX_BLOCK and rex on PATH", () => {
+    assert.equal(getMuxBackend(), "rex");
+    delete process.env.REX_BLOCK;
+    assert.equal(getMuxBackend(), null);
+    process.env.REX_BLOCK = PARENT;
+    process.env.PATH = "/nonexistent";
+    assert.equal(getMuxBackend(), null);
+    process.env.PATH = `${binDir}:/usr/bin:/bin`;
+    // Inside Herdr, Herdr wins even when REX_* are set (no hc here, so null, never rex).
+    process.env.HC_TERMINAL_ID = "t1";
+    assert.equal(getMuxBackend(), null);
+    assert.match(muxSetupHint(), /Rex/);
+  });
+
+  it("splits right of the parent with the ratio, then below the last child, without taking focus", () => {
+    const a = createSurface("Scout  one");
+    const b = createSurface("Worker");
+    assert.deepEqual([a, b], ["block:c1", "block:c2"]);
+    assert.equal(getSplitChildCount(), 2);
+    const [first, second] = rexCalls();
+    assert.deepEqual(first, [
+      "split", "-s", S, "-b", PARENT, "--split=right", "--ratio", "30", "--focus=false",
+      "--label", "Scout one", "--json", "--", "/bin/bash", "--noprofile", "--norc",
+    ]);
+    assert.deepEqual(second.slice(0, 8), ["split", "-s", S, "-b", "block:c1", "--split=below", "--ratio", "50"]);
+  });
+
+  it("opens a Subagents tab past maxSplitChildren and stacks later children in it", () => {
+    createSurface("a");
+    createSurface("b");
+    const c = createSurface("c");
+    const d = createSurface("d");
+    const args = rexCalls();
+    const win = args.find((x) => x[0] === "window")!;
+    assert.deepEqual(win, ["window", "new", "-s", S, "Subagents", "--focus=false", "--json", "--", "/bin/bash", "--noprofile", "--norc"]);
+    const label = args.find((x) => x[0] === "api")!;
+    assert.deepEqual(label.slice(0, 5), ["api", "call", "-s", S, "session.set_block_label"]);
+    assert.deepEqual(JSON.parse(label[5]), { block_id: c, label: "c" });
+    const last = args[args.length - 1];
+    assert.deepEqual(last.slice(0, 6), ["split", "-s", S, "-b", c, "--split=below"]);
+    assert.equal(d, "block:c4");
+  });
+
+  it("opens a new tab when the user closed the Subagents tab", () => {
+    setLayoutMode("tab");
+    const a = createSurface("a");
+    live.delete(a);
+    createSurface("b");
+    assert.equal(rexCalls().filter((x) => x[0] === "window").length, 2);
+  });
+
+  it("sends text then Return, sends Escape, reads the last lines, closes the block", async () => {
+    sendCommand("block:c9", "pi --x 'y'");
+    sendEscape("block:c9");
+    assert.deepEqual(rexCalls(), [
+      ["send", "-s", S, "-b", "block:c9", "pi --x 'y'"],
+      ["send-key", "-s", S, "-b", "block:c9", "enter"],
+      ["send-key", "-s", S, "-b", "block:c9", "escape"],
+    ]);
+    assert.equal(readScreen("block:c9", 2), "line2\nline3");
+    assert.equal(await readScreenAsync("block:c9", 5), "line1\nline2\nline3");
+    const a = createSurface("a");
+    closeSurface(a);
+    assert.equal(getSplitChildCount(), 0);
+    assert.deepEqual(rexCalls().at(-1), ["block close", "-s", S, a].join(" ").split(" "));
+  });
+
+  it("does not write Herdr labels in Rex", () => {
+    setTerminalLabels("block:c1", { "pi.taskid": "1" });
+    assert.equal(calls.length, 0);
+  });
+
+  it("lastLines keeps the last N lines without trailing blank lines", () => {
+    assert.equal(lastLines("a\nb\nc\n\n\n", 2), "b\nc");
+    assert.equal(lastLines("a", 5), "a");
   });
 });

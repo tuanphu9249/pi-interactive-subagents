@@ -3,15 +3,30 @@ import { accessSync, constants, existsSync, readFileSync, rmSync, writeFileSync,
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import {
+  __resetRexState,
+  getRexSplitChildCount,
+  hasRexEnv,
+  rexCloseSurface,
+  rexCreateSurface,
+  rexReadScreen,
+  rexReadScreenAsync,
+  rexSendCommand,
+  rexSendEscape,
+} from "./rex.ts";
 
 /**
- * Herdr Core backend. Child subagents are Herdr terminals shown as panes.
+ * Multiplexer backends. Inside the Herdr app (HC_TERMINAL_ID set) the Herdr Core
+ * backend runs, exactly as before. Otherwise, inside Rex (REX_SESSION and
+ * REX_BLOCK set), the Rex backend in rex.ts runs.
+ *
+ * Herdr Core backend: child subagents are Herdr terminals shown as panes.
  *
  * A "surface" is the child terminal id (for example `t42`). The pane id of
  * each child is kept in a module-level map because pane.split needs it.
  */
 
-export type MuxBackend = "herdr";
+export type MuxBackend = "herdr" | "rex";
 export type LayoutMode = "split" | "tab";
 
 // ---------------------------------------------------------------------------
@@ -77,9 +92,12 @@ function hasCommand(command: string): boolean {
 }
 
 export function getMuxBackend(): MuxBackend | null {
-  if (!process.env.HC_TERMINAL_ID?.trim()) return null;
-  if (!hasCommand("hc") || !hasCommand("herdr-app")) return null;
-  return "herdr";
+  // Herdr first: inside the Herdr app nothing changes.
+  if (process.env.HC_TERMINAL_ID?.trim()) {
+    return hasCommand("hc") && hasCommand("herdr-app") ? "herdr" : null;
+  }
+  if (hasRexEnv() && hasCommand("rex")) return "rex";
+  return null;
 }
 
 export function isMuxAvailable(): boolean {
@@ -87,12 +105,15 @@ export function isMuxAvailable(): boolean {
 }
 
 export function muxSetupHint(): string {
-  return "Run pi inside the Herdr app (HC_TERMINAL_ID must be set and `hc` and `herdr-app` must be on PATH).";
+  return (
+    "Run pi inside the Herdr app (HC_TERMINAL_ID must be set and `hc` and `herdr-app` must be on PATH) " +
+    "or inside Rex (REX_SESSION and REX_BLOCK must be set and `rex` must be on PATH)."
+  );
 }
 
 function requireMuxBackend(): MuxBackend {
   const backend = getMuxBackend();
-  if (!backend) throw new Error(`Herdr Core is not available. ${muxSetupHint()}`);
+  if (!backend) throw new Error(`No terminal multiplexer is available. ${muxSetupHint()}`);
   return backend;
 }
 
@@ -299,6 +320,7 @@ export function __resetHcState(): void {
   panes.clear();
   splitChildren = [];
   subagentsTab = null;
+  __resetRexState();
   settings = null;
   sessionLayout = null;
 }
@@ -309,7 +331,7 @@ export function __setHcSettings(next: Partial<LayoutSettings>): void {
 }
 
 export function getSplitChildCount(): number {
-  return splitChildren.length;
+  return splitChildren.length + getRexSplitChildCount();
 }
 
 /**
@@ -430,6 +452,8 @@ function applyLabels(terminalId: string, name: string, meta?: SurfaceMeta): void
  * label (`k=`). Throws when `hc` fails: callers decide.
  */
 export function setTerminalLabels(terminalId: string, labels: Record<string, string>): void {
+  // Rex blocks have one text label, not key=value labels. Only Herdr mods read these.
+  if (getMuxBackend() === "rex") return;
   hc(["label", terminalId, ...Object.entries(labels).map(([k, v]) => `${k}=${v.replace(/\s+/g, " ").trim()}`)]);
 }
 
@@ -438,7 +462,13 @@ export function setTerminalLabels(terminalId: string, labels: Record<string, str
  * The child runs a clean bash; the caller then sends the real command.
  */
 export function createSurface(name: string, meta?: SurfaceMeta): string {
-  requireMuxBackend();
+  if (requireMuxBackend() === "rex") {
+    return rexCreateSurface(exec, name, {
+      layout: getLayoutMode(),
+      maxSplitChildren: getMaxSplitChildren(),
+      splitRatio: getSplitRatio(),
+    });
+  }
   const parent = locateParent();
   const useSplit = getLayoutMode() === "split" && splitChildren.length < getMaxSplitChildren();
   const terminalId = useSplit ? createSplitChild(parent) : createTabChild(parent);
@@ -451,12 +481,12 @@ export function createSurface(name: string, meta?: SurfaceMeta): string {
 // ---------------------------------------------------------------------------
 
 export function sendCommand(surface: string, command: string): void {
-  requireMuxBackend();
+  if (requireMuxBackend() === "rex") return rexSendCommand(exec, surface, command);
   hc(["send", surface, command]);
 }
 
 export function sendEscape(surface: string): void {
-  requireMuxBackend();
+  if (requireMuxBackend() === "rex") return rexSendEscape(exec, surface);
   hc(["keys", surface, "esc"]);
 }
 
@@ -499,18 +529,18 @@ export function sendLongCommand(
 }
 
 export function readScreen(surface: string, lines = 50): string {
-  requireMuxBackend();
+  if (requireMuxBackend() === "rex") return rexReadScreen(exec, surface, lines);
   return hc(["read", surface, "--lines", String(lines)]);
 }
 
 export async function readScreenAsync(surface: string, lines = 50): Promise<string> {
-  requireMuxBackend();
+  if (requireMuxBackend() === "rex") return rexReadScreenAsync(exec, surface, lines);
   return exec.async("hc", ["read", surface, "--lines", String(lines)]);
 }
 
-/** Kill the child terminal; Herdr closes its pane with it. */
+/** Kill the child terminal; Herdr closes its pane with it. In Rex, close the block. */
 export function closeSurface(surface: string): void {
-  requireMuxBackend();
+  if (requireMuxBackend() === "rex") return rexCloseSurface(exec, surface);
   splitChildren = splitChildren.filter((t) => t !== surface);
   panes.delete(surface);
   hc(["kill", surface]);

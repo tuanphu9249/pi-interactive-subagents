@@ -1747,7 +1747,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           if (runningSubagents.size > 0) updateWidget();
         },
         writeLabels: setTerminalLabels,
-        parentTerminal: () => process.env.HC_TERMINAL_ID,
+        parentTerminal: () =>
+          process.env.HC_TERMINAL_ID ?? (getMuxBackend() === "rex" ? process.env.REX_BLOCK : undefined),
       });
   const rebuildTasks = (ctx: ExtensionContext) => {
     try {

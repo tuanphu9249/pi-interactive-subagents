@@ -1,6 +1,18 @@
 import { describe, it, before, after, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync } from "node:fs";
+import {
+  mkdtempSync,
+  writeFileSync,
+  readFileSync,
+  mkdirSync,
+  rmSync,
+  existsSync,
+  lstatSync,
+  readdirSync,
+  symlinkSync,
+  utimesSync,
+  chmodSync,
+} from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -40,6 +52,13 @@ import {
   muxSetupHint,
 } from "../pi-extension/subagents/hc.ts";
 import { lastLines } from "../pi-extension/subagents/rex.ts";
+import {
+  readRexLabels,
+  removeRexLabels,
+  rexLabelsDir,
+  rexLabelsFile,
+  writeRexLabels,
+} from "../pi-extension/subagents/rex-labels.ts";
 import { resolveChildExtensions, parseExtensionsField } from "../pi-extension/subagents/child-extensions.ts";
 import {
   advanceStatusState,
@@ -3852,6 +3871,7 @@ describe("hc.ts Rex backend", () => {
     path: process.env.PATH,
     session: process.env.REX_SESSION,
     block: process.env.REX_BLOCK,
+    xdg: process.env.XDG_STATE_HOME,
   };
   const S = "session:s1";
   const PARENT = "block:parent";
@@ -3860,6 +3880,7 @@ describe("hc.ts Rex backend", () => {
   let next: number;
   let live: Set<string>;
   let screen: string;
+  let stateDir: string;
 
   const restore = (key: string, value: string | undefined) => {
     if (value === undefined) delete process.env[key];
@@ -3879,6 +3900,8 @@ describe("hc.ts Rex backend", () => {
     next = 1;
     live = new Set([PARENT]);
     screen = "line1\nline2\nline3\n\n";
+    stateDir = mkdtempSync(join(tmpdir(), "rex-state-"));
+    process.env.XDG_STATE_HOME = stateDir;
     __resetHcState();
     __setHcSettings({ layout: "split", maxSplitChildren: 2, splitRatio: 0.3 });
     delete process.env.HC_TERMINAL_ID;
@@ -3914,7 +3937,9 @@ describe("hc.ts Rex backend", () => {
     restore("HC_TERMINAL_ID", saved.id);
     restore("REX_SESSION", saved.session);
     restore("REX_BLOCK", saved.block);
+    restore("XDG_STATE_HOME", saved.xdg);
     process.env.PATH = saved.path;
+    rmSync(stateDir, { recursive: true, force: true });
   });
 
   const rexCalls = () => calls.filter((c) => c.file === "rex").map((c) => c.args);
@@ -3986,13 +4011,172 @@ describe("hc.ts Rex backend", () => {
     assert.deepEqual(rexCalls().at(-1), ["block close", "-s", S, a].join(" ").split(" "));
   });
 
-  it("does not write Herdr labels in Rex", () => {
-    setTerminalLabels("block:c1", { "pi.taskid": "1" });
+  it("sends no hc label calls in Rex and writes the labels to the store instead", () => {
+    setTerminalLabels("block:c1", { "pi.tasks": "3/7", "pi.tasknow": "#4  Do   it" });
     assert.equal(calls.length, 0);
+    const file = join(stateDir, "pi-subagents", "rex-labels", "block_c1.json");
+    const data = JSON.parse(readFileSync(file, "utf8"));
+    assert.equal(data.version, 1);
+    assert.equal(data.block_id, "block:c1");
+    assert.deepEqual(data.labels, { "pi.tasks": "3/7", "pi.tasknow": "#4 Do it" });
+    assert.equal(typeof data.updated, "number");
+    setTerminalLabels("block:c1", { "pi.tasknow": "" });
+    assert.deepEqual(readRexLabels("block:c1"), { "pi.tasks": "3/7" });
+  });
+
+  it("createSurface writes the Herdr child labels to the store, with pi.parent = REX_BLOCK", () => {
+    const c = createSurface("Scout  one", { role: "scout", task: "look\naround", taskId: "4", taskSubject: "Find  it" });
+    const labels = readRexLabels(c)!;
+    assert.equal(labels["pi.subagent"], "1");
+    assert.equal(labels["pi.role"], "scout");
+    assert.equal(labels["pi.name"], "Scout one");
+    assert.equal(labels["pi.parent"], PARENT);
+    assert.equal(labels["pi.task"], "look around");
+    assert.match(labels["pi.started"], /^\d+$/);
+    assert.equal(labels["pi.taskid"], "4");
+    assert.equal(labels["pi.tasksubject"], "Find it");
+    const plain = readRexLabels(createSurface("Plain"))!;
+    assert.equal(plain["pi.role"], "none");
+    assert.equal("pi.taskid" in plain, false);
+  });
+
+  it("closeSurface removes the child's file and keeps the others", () => {
+    const a = createSurface("a");
+    const b = createSurface("b");
+    closeSurface(a);
+    assert.equal(readRexLabels(a), null);
+    assert.ok(readRexLabels(b));
+  });
+
+  it("closeSurface removes the file even when the close call fails", () => {
+    const a = createSurface("a");
+    __setHcExec({
+      sync: () => {
+        throw new Error("boom");
+      },
+      async: async () => "",
+    });
+    assert.throws(() => closeSurface(a), /boom/);
+    assert.equal(readRexLabels(a), null);
+  });
+
+  it("createSurface still returns the block when the store cannot be written", () => {
+    mkdirSync(join(stateDir, "pi-subagents"), { recursive: true });
+    symlinkSync(stateDir, join(stateDir, "pi-subagents", "rex-labels"));
+    assert.equal(createSurface("a"), "block:c1");
+  });
+
+  it("the TaskController parent label path reaches the store through REX_BLOCK", () => {
+    const parent = () => process.env.HC_TERMINAL_ID ?? (getMuxBackend() === "rex" ? process.env.REX_BLOCK : undefined);
+    assert.equal(parent(), PARENT);
+    setTerminalLabels(parent()!, { "pi.tasks": "1/2" });
+    assert.deepEqual(readRexLabels(PARENT), { "pi.tasks": "1/2" });
   });
 
   it("lastLines keeps the last N lines without trailing blank lines", () => {
     assert.equal(lastLines("a\nb\nc\n\n\n", 2), "b\nc");
     assert.equal(lastLines("a", 5), "a");
+  });
+});
+
+describe("rex-labels.ts store", () => {
+  const savedXdg = process.env.XDG_STATE_HOME;
+  let stateDir: string;
+  const B = "block:01a1fb72-59d3-7484-9521-e119b1d3e123";
+
+  beforeEach(() => {
+    stateDir = mkdtempSync(join(tmpdir(), "rex-store-"));
+    process.env.XDG_STATE_HOME = stateDir;
+  });
+  afterEach(() => {
+    if (savedXdg === undefined) delete process.env.XDG_STATE_HOME;
+    else process.env.XDG_STATE_HOME = savedXdg;
+    rmSync(stateDir, { recursive: true, force: true });
+  });
+
+  it("uses XDG_STATE_HOME, falls back to ~/.local/state, and names files by block id", () => {
+    assert.equal(rexLabelsDir(), join(stateDir, "pi-subagents", "rex-labels"));
+    assert.equal(
+      rexLabelsFile(B),
+      join(stateDir, "pi-subagents", "rex-labels", "block_01a1fb72-59d3-7484-9521-e119b1d3e123.json"),
+    );
+    delete process.env.XDG_STATE_HOME;
+    assert.match(rexLabelsDir(), /\/\.local\/state\/pi-subagents\/rex-labels$/);
+  });
+
+  it("creates the directory 0700 and the file 0600, merges, and deletes on an empty value", () => {
+    writeRexLabels(B, { "pi.subagent": "1", "pi.name": "x" });
+    writeRexLabels(B, { "pi.activity": "thinking", "pi.name": "" });
+    assert.deepEqual(readRexLabels(B), { "pi.subagent": "1", "pi.activity": "thinking" });
+    assert.equal(lstatSync(rexLabelsDir()).mode & 0o777, 0o700);
+    assert.equal(lstatSync(rexLabelsFile(B)).mode & 0o777, 0o600);
+    // No temporary file is left behind.
+    assert.deepEqual(readdirSync(rexLabelsDir()), [rexLabelsFile(B).split("/").pop()]);
+  });
+
+  it("removeRexLabels deletes the file and does not throw for a missing one", () => {
+    writeRexLabels(B, { a: "1" });
+    removeRexLabels(B);
+    assert.equal(existsSync(rexLabelsFile(B)), false);
+    removeRexLabels(B);
+  });
+
+  it("rejects ids that are not block ids", () => {
+    assert.throws(() => writeRexLabels("block:../../x", { a: "1" }), /Invalid Rex block id/);
+    assert.throws(() => writeRexLabels("t1", { a: "1" }), /Invalid Rex block id/);
+  });
+
+  it("refuses a result over 16 KiB", () => {
+    assert.throws(() => writeRexLabels(B, { "pi.task": "x".repeat(17 * 1024) }), /16 KiB/);
+    assert.equal(readRexLabels(B), null);
+  });
+
+  it("does not follow a symlinked file and replaces it with a regular file", () => {
+    writeRexLabels(B, { a: "1" });
+    const target = join(stateDir, "target.json");
+    writeFileSync(target, JSON.stringify({ version: 1, block_id: B, labels: { evil: "1" }, updated: 1 }));
+    rmSync(rexLabelsFile(B));
+    symlinkSync(target, rexLabelsFile(B));
+    assert.equal(readRexLabels(B), null);
+    writeRexLabels(B, { b: "2" });
+    assert.equal(lstatSync(rexLabelsFile(B)).isSymbolicLink(), false);
+    assert.deepEqual(readRexLabels(B), { b: "2" });
+    assert.equal(JSON.parse(readFileSync(target, "utf8")).labels.evil, "1");
+  });
+
+  it("refuses a symlinked directory", () => {
+    mkdirSync(join(stateDir, "pi-subagents"), { recursive: true });
+    mkdirSync(join(stateDir, "elsewhere"));
+    symlinkSync(join(stateDir, "elsewhere"), rexLabelsDir());
+    assert.throws(() => writeRexLabels(B, { a: "1" }), /Unsafe/);
+    assert.deepEqual(readdirSync(join(stateDir, "elsewhere")), []);
+  });
+
+  it("starts fresh when the existing file is corrupt or names another block", () => {
+    writeRexLabels(B, { a: "1" });
+    writeFileSync(rexLabelsFile(B), "{not json");
+    writeRexLabels(B, { b: "2" });
+    assert.deepEqual(readRexLabels(B), { b: "2" });
+    writeFileSync(rexLabelsFile(B), JSON.stringify({ version: 1, block_id: "block:other", labels: { c: "3" }, updated: 1 }));
+    assert.equal(readRexLabels(B), null);
+  });
+
+  it("tightens a directory that has group or other permission bits", () => {
+    writeRexLabels(B, { a: "1" });
+    chmodSync(rexLabelsDir(), 0o755);
+    writeRexLabels(B, { b: "2" });
+    assert.equal(lstatSync(rexLabelsDir()).mode & 0o777, 0o700);
+  });
+
+  it("removes files older than 7 days on the first write in a process, keeps newer ones", () => {
+    const dir = rexLabelsDir();
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const old = new Date(Date.now() - 8 * 24 * 3600 * 1000);
+    writeFileSync(join(dir, "block_old.json"), "{}");
+    utimesSync(join(dir, "block_old.json"), old, old);
+    writeFileSync(join(dir, "block_new.json"), "{}");
+    writeRexLabels(B, { a: "1" });
+    assert.equal(existsSync(join(dir, "block_old.json")), false);
+    assert.equal(existsSync(join(dir, "block_new.json")), true);
   });
 });

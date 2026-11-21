@@ -9,6 +9,7 @@ import { Type } from "@sinclair/typebox";
 import { execFile } from "node:child_process";
 import { writeFileSync } from "node:fs";
 import { createSubagentActivityRecorder } from "./activity.ts";
+import { writeRexLabels } from "./rex-labels.ts";
 import { createActivityLabelWriter, createInboxConsumer, formatToolActivity } from "./steer.ts";
 
 const INBOX_POLL_INTERVAL_MS = 1000;
@@ -22,6 +23,14 @@ function runActivityLabel(terminalId: string, text: string): Promise<void> {
       resolve();
     }
   });
+}
+
+/** Rex child: write `pi.activity` to the Rex label store for the block. */
+function runRexActivityLabel(blockId: string, text: string): Promise<void> {
+  try {
+    writeRexLabels(blockId, { "pi.activity": text });
+  } catch {}
+  return Promise.resolve();
 }
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
@@ -106,9 +115,13 @@ export default function (pi: ExtensionAPI) {
   });
 
   const terminalId = process.env.HC_TERMINAL_ID?.trim();
+  // A Rex child has no HC_TERMINAL_ID but has REX_BLOCK.
+  const rexBlock = terminalId ? undefined : process.env.REX_BLOCK?.trim();
   const activityLabel = terminalId
     ? createActivityLabelWriter({ run: (text) => runActivityLabel(terminalId, text) })
-    : null;
+    : rexBlock
+      ? createActivityLabelWriter({ run: (text) => runRexActivityLabel(rexBlock, text) })
+      : null;
   const inboxFile = process.env.PI_SUBAGENT_INBOX_FILE?.trim();
   let inboxTimer: ReturnType<typeof setInterval> | null = null;
 

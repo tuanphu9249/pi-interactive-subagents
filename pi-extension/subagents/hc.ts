@@ -14,6 +14,7 @@ import {
   rexSendCommand,
   rexSendEscape,
 } from "./rex.ts";
+import { removeRexLabels, writeRexLabels } from "./rex-labels.ts";
 
 /**
  * Multiplexer backends. Inside the Herdr app (HC_TERMINAL_ID set) the Herdr Core
@@ -430,31 +431,40 @@ function createTabChild(parent: TerminalLocation): string {
   return terminalId;
 }
 
-function applyLabels(terminalId: string, name: string, meta?: SurfaceMeta): void {
+/** The labels a new child carries. `parent` is the parent's terminal (Herdr) or block (Rex) id. */
+function childLabels(name: string, parent: string, meta?: SurfaceMeta): Record<string, string> {
   const task = (meta?.task ?? "").replace(/\s+/g, " ").trim().slice(0, 120);
-  const labels = [
-    "pi.subagent=1",
-    `pi.role=${meta?.role?.trim() || "none"}`,
-    `pi.name=${name.replace(/\s+/g, " ").trim()}`,
-    `pi.parent=${process.env.HC_TERMINAL_ID ?? ""}`,
-    `pi.task=${task}`,
-    `pi.started=${Date.now()}`,
-  ];
+  const labels: Record<string, string> = {
+    "pi.subagent": "1",
+    "pi.role": meta?.role?.trim() || "none",
+    "pi.name": name.replace(/\s+/g, " ").trim(),
+    "pi.parent": parent,
+    "pi.task": task,
+    "pi.started": String(Date.now()),
+  };
   if (meta?.taskId) {
-    const subject = (meta.taskSubject ?? "").replace(/\s+/g, " ").trim().slice(0, 80);
-    labels.push(`pi.taskid=${meta.taskId}`, `pi.tasksubject=${subject}`);
+    labels["pi.taskid"] = meta.taskId;
+    labels["pi.tasksubject"] = (meta.taskSubject ?? "").replace(/\s+/g, " ").trim().slice(0, 80);
   }
-  hc(["label", terminalId, ...labels]);
+  return labels;
+}
+
+function applyLabels(terminalId: string, name: string, meta?: SurfaceMeta): void {
+  const labels = childLabels(name, process.env.HC_TERMINAL_ID ?? "", meta);
+  hc(["label", terminalId, ...Object.entries(labels).map(([k, v]) => `${k}=${v}`)]);
 }
 
 /**
  * Set labels on a terminal (`hc label <t> k=v...`). An empty value removes the
  * label (`k=`). Throws when `hc` fails: callers decide.
+ *
+ * In Rex the labels go to the Rex label store (rex-labels.ts) for the block, since a
+ * Rex block has no key=value labels. It throws when the store cannot be written.
  */
 export function setTerminalLabels(terminalId: string, labels: Record<string, string>): void {
-  // Rex blocks have one text label, not key=value labels. Only Herdr mods read these.
-  if (getMuxBackend() === "rex") return;
-  hc(["label", terminalId, ...Object.entries(labels).map(([k, v]) => `${k}=${v.replace(/\s+/g, " ").trim()}`)]);
+  const clean = Object.entries(labels).map(([k, v]) => [k, v.replace(/\s+/g, " ").trim()] as const);
+  if (getMuxBackend() === "rex") return writeRexLabels(terminalId, Object.fromEntries(clean));
+  hc(["label", terminalId, ...clean.map(([k, v]) => `${k}=${v}`)]);
 }
 
 /**
@@ -463,11 +473,16 @@ export function setTerminalLabels(terminalId: string, labels: Record<string, str
  */
 export function createSurface(name: string, meta?: SurfaceMeta): string {
   if (requireMuxBackend() === "rex") {
-    return rexCreateSurface(exec, name, {
+    const block = rexCreateSurface(exec, name, {
       layout: getLayoutMode(),
       maxSplitChildren: getMaxSplitChildren(),
       splitRatio: getSplitRatio(),
     });
+    // The labels only feed the session strip: a store failure must not orphan the new block.
+    try {
+      writeRexLabels(block, childLabels(name, process.env.REX_BLOCK?.trim() ?? "", meta));
+    } catch {}
+    return block;
   }
   const parent = locateParent();
   const useSplit = getLayoutMode() === "split" && splitChildren.length < getMaxSplitChildren();
@@ -540,7 +555,13 @@ export async function readScreenAsync(surface: string, lines = 50): Promise<stri
 
 /** Kill the child terminal; Herdr closes its pane with it. In Rex, close the block. */
 export function closeSurface(surface: string): void {
-  if (requireMuxBackend() === "rex") return rexCloseSurface(exec, surface);
+  if (requireMuxBackend() === "rex") {
+    try {
+      return rexCloseSurface(exec, surface);
+    } finally {
+      removeRexLabels(surface);
+    }
+  }
   splitChildren = splitChildren.filter((t) => t !== surface);
   panes.delete(surface);
   hc(["kill", surface]);

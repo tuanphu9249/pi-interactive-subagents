@@ -31,7 +31,7 @@ pi install git:github.com/HazAT/pi-interactive-subagents
 
 Backends: Herdr Core and Rex. Run pi inside the Herdr app (`HC_TERMINAL_ID` set; `hc` and `herdr-app` on PATH). Each subagent is a Herdr terminal shown as a pane.
 
-Rex: run pi inside Rex (`REX_SESSION` and `REX_BLOCK` set; `rex` on PATH, and `HC_TERMINAL_ID` not set). Each subagent is a Rex terminal block. The first child splits right of the parent with `splitRatio`, later children split below the last one; new blocks do not take focus (`--focus=false`). Past `maxSplitChildren`, or with `layout: "tab"`, children go to a `Subagents` tab. Rex blocks carry one text label (the subagent name), so the Herdr `pi.*` key=value labels are not written. Inside Herdr, the Herdr backend always wins.
+Rex: run pi inside Rex (`REX_SESSION` and `REX_BLOCK` set; `rex` on PATH, and `HC_TERMINAL_ID` not set). Each subagent is a Rex terminal block. The first child splits right of the parent with `splitRatio`, later children split below the last one; new blocks do not take focus (`--focus=false`). Past `maxSplitChildren`, or with `layout: "tab"`, children go to a `Subagents` tab. Rex blocks carry one text label (the subagent name) and no key=value labels, so the `pi.*` labels go to the Rex label store instead (see [Terminal labels](#terminal-labels)). Inside Herdr, the Herdr backend always wins.
 
 Layout (new children only):
 
@@ -264,6 +264,8 @@ The parent terminal (`$HC_TERMINAL_ID`) gets two labels after every task change:
 | ------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
 | `pi.tasks`    | `<completed>/<total>`, for example `3/7`. `total` does not count `cancelled` tasks.                                                |
 | `pi.tasknow`  | `#<id> <subject>` of the first `in_progress` task that has no child owner, plus ` +N` for N more. Removed when there is none.      |
+
+In Rex the same labels go to a JSON file per block, not to `hc`: `$XDG_STATE_HOME/pi-subagents/rex-labels/<block id with ":" as "_">.json` (`~/.local/state/...` when `XDG_STATE_HOME` is unset). The directory has mode 0700 and each file mode 0600, 16 KiB max, with the content `{"version":1,"block_id":"block:…","labels":{…},"updated":<ms>}`. A write merges into the file (an empty value removes the key) and replaces it by rename; it never follows symlinks. The parent's task labels go to `$REX_BLOCK`, a child writes `pi.activity` for its own `$REX_BLOCK`, and `pi.parent` is the parent's block id. Closing a child removes its file. The first write in a process also deletes files older than 7 days. The Rex session strip reads these files.
 
 An empty value removes a label (`hc label <terminal> key=`). With an empty task list both parent labels are removed. A failed `hc label` call never fails the tool; the next change tries again.
 

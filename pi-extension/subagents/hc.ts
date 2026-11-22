@@ -105,11 +105,11 @@ export function isMuxAvailable(): boolean {
   return getMuxBackend() !== null;
 }
 
+/** The hint names Rex only on a machine that has `rex`: a machine without Rex gets no Rex text. */
 export function muxSetupHint(): string {
-  return (
-    "Run pi inside the Herdr app (HC_TERMINAL_ID must be set and `hc` and `herdr-app` must be on PATH) " +
-    "or inside Rex (REX_SESSION and REX_BLOCK must be set and `rex` must be on PATH)."
-  );
+  const herdr = "Run pi inside the Herdr app (HC_TERMINAL_ID must be set and `hc` and `herdr-app` must be on PATH)";
+  if (!hasCommand("rex")) return `${herdr}.`;
+  return `${herdr} or inside Rex (REX_SESSION and REX_BLOCK must be set).`;
 }
 
 function requireMuxBackend(): MuxBackend {

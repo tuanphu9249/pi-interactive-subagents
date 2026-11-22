@@ -4026,6 +4026,13 @@ describe("hc.ts Rex backend", () => {
     assert.match(muxSetupHint(), /Rex/);
   });
 
+  it("names Rex in the setup hint only when rex is on PATH", () => {
+    assert.match(muxSetupHint(), /Herdr.*Rex/);
+    process.env.PATH = "/nonexistent";
+    assert.match(muxSetupHint(), /Herdr/);
+    assert.doesNotMatch(muxSetupHint(), /rex/i);
+  });
+
   it("splits right of the parent with the ratio, then below the last child, without taking focus", () => {
     const a = createSurface("Scout  one");
     const b = createSurface("Worker");

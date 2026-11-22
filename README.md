@@ -87,7 +87,7 @@ Child panes start a clean bash and get the launch command by `hc send`. Note: th
 | **reviewer**      | Opus (medium thinking) | Reviews code for bugs, security issues, correctness                                      |
 | **visual-tester** | Sonnet                 | Visual QA via Chrome CDP — screenshots, responsive testing, interaction testing          |
 
-Agent discovery follows priority: **project-local** (`.pi/agents/`) > **global** (`~/.pi/agent/agents/`) > **package-bundled**. Override any bundled agent by placing your own version in the higher-priority location.
+Agent discovery follows priority: **project-local** (`.pi/agents/`) > **global** (`~/.pi/agent/agents/`) > **package-bundled**. Override any bundled agent by placing your own version in the higher-priority location. Project-local agents load only when Pi trusts the project (`~/.pi/agent/trust.json`): an agent definition can set `cli` and `extensions`, so it is code.
 
 ---
 

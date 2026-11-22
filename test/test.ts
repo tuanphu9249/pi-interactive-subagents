@@ -203,6 +203,7 @@ async function withIsolatedAgentEnv(
     globalDir: string;
     globalAgentsDir: string;
   }) => Promise<void> | void,
+  trusted: boolean | null = true, // null = unknown (ask Pi; no session context)
 ) {
   const root = createTestDir();
   const previousCwd = process.cwd();
@@ -216,10 +217,13 @@ async function withIsolatedAgentEnv(
   mkdirSync(globalAgentsDir, { recursive: true });
   process.chdir(projectDir);
   process.env.PI_CODING_AGENT_DIR = globalDir;
+  // Most discovery tests use project agents: run them as a trusted project.
+  (subagentsModule as any).__test__.setProjectTrustOverride(trusted ?? undefined);
 
   try {
     await fn({ projectDir, projectAgentsDir, globalDir, globalAgentsDir });
   } finally {
+    (subagentsModule as any).__test__.setProjectTrustOverride(undefined);
     process.chdir(previousCwd);
     restoreEnvVar("PI_CODING_AGENT_DIR", previousAgentDir);
     rmSync(root, { recursive: true, force: true });
@@ -924,6 +928,70 @@ describe("status.ts", () => {
 
 describe("subagent discovery", () => {
   const testApi = (subagentsModule as any).__test__;
+
+  describe("project trust", () => {
+    const writeShadowPair = (projectAgentsDir: string, globalAgentsDir: string) => {
+      writeAgentFile(
+        globalAgentsDir,
+        "trust-test-agent",
+        ["name: trust-test-agent", "description: Global agent", "model: anthropic/test-global"].join("\n"),
+        "You are the global agent.",
+      );
+      writeAgentFile(
+        projectAgentsDir,
+        "trust-test-agent",
+        [
+          "name: trust-test-agent",
+          "description: Project agent",
+          "model: anthropic/test-project",
+          "cli: claude",
+          "extensions: ./evil.ts",
+        ].join("\n"),
+        "You are the project agent.",
+      );
+      writeAgentFile(
+        projectAgentsDir,
+        "project-only-trust-agent",
+        ["name: project-only-trust-agent", "description: Project only"].join("\n"),
+      );
+    };
+
+    for (const [label, trusted] of [
+      ["untrusted", false],
+      ["unknown (no session context)", null],
+    ] as const) {
+      it(`ignores .pi/agents when the project is ${label}`, async () => {
+        await withIsolatedAgentEnv(
+          async ({ projectAgentsDir, globalAgentsDir }) => {
+            writeShadowPair(projectAgentsDir, globalAgentsDir);
+            assert.equal(testApi.projectAgentsAllowed(), false);
+
+            const loaded = testApi.loadAgentDefaults("trust-test-agent");
+            assert.ok(loaded, "expected the global agent to load");
+            assert.equal(loaded.model, "anthropic/test-global");
+            assert.equal(loaded.cli, undefined);
+            assert.equal(testApi.loadAgentDefaults("project-only-trust-agent"), null);
+
+            const listed = testApi.discoverAgentDefinitions();
+            assert.equal(listed.some((agent: any) => agent.source === "project"), false);
+            assert.equal(listed.find((agent: any) => agent.name === "trust-test-agent")?.source, "global");
+          },
+          trusted,
+        );
+      });
+    }
+
+    it("loads .pi/agents when the project is trusted", async () => {
+      await withIsolatedAgentEnv(async ({ projectAgentsDir, globalAgentsDir }) => {
+        writeShadowPair(projectAgentsDir, globalAgentsDir);
+        const loaded = testApi.loadAgentDefaults("trust-test-agent");
+        assert.equal(loaded.model, "anthropic/test-project");
+        assert.ok(testApi.loadAgentDefaults("project-only-trust-agent"));
+        const listed = testApi.discoverAgentDefinitions();
+        assert.equal(listed.find((agent: any) => agent.name === "trust-test-agent")?.source, "project");
+      });
+    });
+  });
 
   it("loads session-mode from frontmatter", async () => {
     await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {

@@ -278,13 +278,32 @@ function parseAgentDefinition(content: string, fallbackName: string): AgentDefin
   };
 }
 
+/** Test hook: force the project-trust answer. `undefined` = ask Pi. */
+let projectTrustOverride: boolean | undefined;
+
+/**
+ * Project agents (`<cwd>/.pi/agents/*.md`) can set `cli`, `extensions` and the
+ * system prompt, so they are code. Load them only when Pi has granted project
+ * trust for this session. Unknown trust (no session yet, old Pi) = not trusted.
+ */
+function projectAgentsAllowed(): boolean {
+  if (projectTrustOverride !== undefined) return projectTrustOverride;
+  try {
+    return (latestCtx as any)?.isProjectTrusted?.() === true;
+  } catch {
+    return false;
+  }
+}
+
 function discoverAgentDefinitions(): ListedAgentDefinition[] {
   const agents = new Map<string, ListedAgentDefinition>();
   const dirs: Array<{ path: string; source: AgentSource }> = [
     { path: getBundledAgentsDir(), source: "package" },
     { path: join(getAgentConfigDir(), "agents"), source: "global" },
-    { path: join(process.cwd(), ".pi", "agents"), source: "project" },
   ];
+  if (projectAgentsAllowed()) {
+    dirs.push({ path: join(process.cwd(), ".pi", "agents"), source: "project" });
+  }
 
   for (const { path: dir, source } of dirs) {
     if (!existsSync(dir)) continue;
@@ -384,7 +403,7 @@ function resolveEffectiveAutoExit(agentDefs: AgentDefaults | null, interactive: 
 function loadAgentDefaults(agentName: string): AgentDefaults | null {
   const configDir = getAgentConfigDir();
   const paths = [
-    join(process.cwd(), ".pi", "agents", `${agentName}.md`),
+    ...(projectAgentsAllowed() ? [join(process.cwd(), ".pi", "agents", `${agentName}.md`)] : []),
     join(configDir, "agents", `${agentName}.md`),
     join(getBundledAgentsDir(), `${agentName}.md`),
   ];
@@ -1214,6 +1233,10 @@ function resolveResumeLaunchBehavior(params: { autoExit?: boolean }): { autoExit
 }
 
 export const __test__ = {
+  setProjectTrustOverride: (value: boolean | undefined) => {
+    projectTrustOverride = value;
+  },
+  projectAgentsAllowed,
   formatRunningSubagents,
   getModuleAbortSignal,
   borderLine,
@@ -2462,7 +2485,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       const defs = loadAgentDefaults(agentName);
       if (!defs) {
         ctx.ui.notify(
-          `Agent "${agentName}" not found in ~/.pi/agent/agents/ or .pi/agents/`,
+          `Agent "${agentName}" not found in ~/.pi/agent/agents/ or .pi/agents/` +
+            (projectAgentsAllowed() ? "" : " (.pi/agents/ is skipped: this project is not trusted)"),
           "error",
         );
         return;

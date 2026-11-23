@@ -2030,7 +2030,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
       renderCall(args, theme) {
         const partialArgs = args as Record<string, unknown>;
-        const name = typeof partialArgs.name === "string" && partialArgs.name ? partialArgs.name : "(unnamed)";
+        // The call is drawn while the model still writes its arguments: until the name has arrived, say so
+        // (a bold "(unnamed)" here read as an agent without a name).
+        const name = typeof partialArgs.name === "string" && partialArgs.name ? partialArgs.name : "";
         const task = typeof partialArgs.task === "string" ? partialArgs.task : "";
         const agent = typeof partialArgs.agent === "string" && partialArgs.agent
           ? theme.fg("dim", ` (${partialArgs.agent})`)
@@ -2040,7 +2042,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           : "";
         let text =
           "▸ " +
-          theme.fg("toolTitle", theme.bold(name)) +
+          (name ? theme.fg("toolTitle", theme.bold(name)) : theme.fg("dim", "starting sub-agent…")) +
           agent +
           cwdHint;
 

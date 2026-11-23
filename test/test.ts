@@ -1560,7 +1560,12 @@ describe("tool registration", () => {
     const rendered = subagentTool.renderCall({}, theme);
     const output = rendered.render(80).join("\n");
 
-    assert.match(output, /\(unnamed\)/);
+    assert.match(output, /starting sub-agent…/);
+    assert.doesNotMatch(output, /\(unnamed\)/);
+
+    const named = subagentTool.renderCall({ name: "scout-1" }, theme).render(80).join("\n");
+    assert.match(named, /▸ scout-1/);
+    assert.doesNotMatch(named, /starting sub-agent/);
   });
 
   it("registers subagent_resume with an autoExit override", () => {

@@ -525,7 +525,7 @@ interface SubagentResult {
   /** Provider/agent error message when auto-retry exhausted (overload, rate limit, etc.). */
   errorMessage?: string;
   ping?: { name: string; message: string };
-  /** The terminal ended without a subagent_done result (crash or kill). */
+  /** The terminal ended and the child wrote no result (crash or kill). A clean end of an auto-exit child writes one. */
   noResult?: boolean;
 }
 

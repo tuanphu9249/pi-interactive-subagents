@@ -92,6 +92,31 @@ export function findLatestAssistantError(
   return null;
 }
 
+/**
+ * The `.exit` sidecar of an auto-exit child whose turn ended without
+ * subagent_done or caller_ping. An error turn (auto-retry exhausted, provider
+ * overload, etc.) gives `type: "error"`, so the parent reports a clear failure
+ * and does not mistake a stale assistant message for a result. Any other end
+ * is the child's normal completion: `type: "done"`, with the text of the last
+ * assistant message that has text as the summary. Without text there is no
+ * summary and the parent reads the session file.
+ */
+export function autoExitSidecar(
+  messages: any[] | undefined,
+): { type: "error"; errorMessage: string; stopReason: "error" } | { type: "done"; summary?: string } {
+  const errorInfo = findLatestAssistantError(messages);
+  if (errorInfo) return { type: "error", ...errorInfo };
+  for (let i = (messages?.length ?? 0) - 1; i >= 0; i--) {
+    const msg = messages![i];
+    if (msg?.role !== "assistant" || !Array.isArray(msg.content)) continue;
+    const texts = msg.content
+      .filter((block: any) => block?.type === "text" && typeof block.text === "string" && block.text.trim() !== "")
+      .map((block: any) => block.text as string);
+    if (texts.length > 0) return { type: "done", summary: texts.join("\n") };
+  }
+  return { type: "done" };
+}
+
 export function parseDeniedTools(rawValue: string | undefined): string[] {
   return (rawValue ?? "")
     .split(",")
@@ -109,6 +134,8 @@ export default function (pi: ExtensionAPI) {
   const subagentAgent = process.env.PI_SUBAGENT_AGENT ?? "";
   const deniedToolsValue = process.env.PI_DENY_TOOLS;
   const autoExit = process.env.PI_SUBAGENT_AUTO_EXIT === "1";
+  /** subagent_done or caller_ping wrote the .exit sidecar: the auto-exit path must not replace it. */
+  let resultWritten = false;
   const recorder = createSubagentActivityRecorder({
     runningChildId: process.env.PI_SUBAGENT_ID,
     activityFile: process.env.PI_SUBAGENT_ACTIVITY_FILE,
@@ -224,26 +251,17 @@ export default function (pi: ExtensionAPI) {
     else activityLabel?.set("waiting");
 
     if (shouldExit) {
-      // Surface stopReason: "error" turns (auto-retry exhausted, provider
-      // overload, etc.) to the parent via the .exit sidecar so the watcher
-      // can report a clear failure with the underlying error message.
-      // Without this the parent would only see exit code 0 and a stale
-      // assistant message, mistaking the crash for a successful completion.
-      const errorInfo = findLatestAssistantError(messages);
+      // Tell the parent how the turn ended, via the .exit sidecar (autoExitSidecar).
+      // Without it the parent sees only the terminal end with exit code 0: it cannot
+      // tell a clean end from a crash, and it marks the child's task as failed.
+      // Not when subagent_done or caller_ping wrote theirs in this turn: that one is the result.
       const sessionFile = process.env.PI_SUBAGENT_SESSION;
-      if (errorInfo && sessionFile) {
+      if (sessionFile && !resultWritten) {
         try {
-          writeFileSync(
-            `${sessionFile}.exit`,
-            JSON.stringify({
-              type: "error",
-              errorMessage: errorInfo.errorMessage,
-              stopReason: errorInfo.stopReason,
-            }),
-          );
+          writeFileSync(`${sessionFile}.exit`, JSON.stringify(autoExitSidecar(messages)));
         } catch {
           // Best effort — even without the sidecar, watcher's session-file
-          // fallback can still recover the errorMessage.
+          // fallback can still recover the last message or the errorMessage.
         }
       }
 
@@ -342,6 +360,7 @@ export default function (pi: ExtensionAPI) {
         message: params.message,
       };
       writeFileSync(`${sessionFile}.exit`, JSON.stringify(exitData));
+      resultWritten = true;
 
       ctx.shutdown();
       return {
@@ -368,6 +387,7 @@ export default function (pi: ExtensionAPI) {
       recorder.subagentDone();
       if (sessionFile) {
         writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type: "done", ...(params.summary?.trim() ? { summary: params.summary } : {}) }));
+        resultWritten = true;
       }
       ctx.shutdown();
       return {

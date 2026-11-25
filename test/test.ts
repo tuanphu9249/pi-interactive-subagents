@@ -88,6 +88,7 @@ import {
   shouldMarkUserTookOver,
   shouldAutoExitOnAgentEnd,
   findLatestAssistantError,
+  autoExitSidecar,
 } from "../pi-extension/subagents/subagent-done.ts";
 import { __pollForExitTest__ } from "../pi-extension/subagents/hc.ts";
 import {
@@ -1387,6 +1388,47 @@ describe("subagent-done.ts", () => {
       // failure detail; staying open would just strand the worker.
       const messages = [{ role: "assistant", stopReason: "error", errorMessage: "529 overloaded" }];
       assert.equal(shouldAutoExitOnAgentEnd(false, messages), true);
+    });
+  });
+
+  describe("autoExitSidecar", () => {
+    const text = (t: string) => ({ type: "text", text: t });
+
+    it("a clean end is a done result with the last assistant text", () => {
+      const messages = [
+        { role: "assistant", stopReason: "toolUse", content: [text("first")] },
+        { role: "toolResult", content: [text("out")] },
+        { role: "assistant", stopReason: "stop", content: [text("the"), { type: "thinking", thinking: "x" }, text("result")] },
+      ];
+      assert.deepEqual(autoExitSidecar(messages), { type: "done", summary: "the\nresult" });
+    });
+
+    it("skips an assistant message without text", () => {
+      const messages = [
+        { role: "assistant", stopReason: "toolUse", content: [text("earlier")] },
+        { role: "assistant", stopReason: "stop", content: [text("  ")] },
+      ];
+      assert.deepEqual(autoExitSidecar(messages), { type: "done", summary: "earlier" });
+    });
+
+    it("no text and no messages give a done result without a summary", () => {
+      assert.deepEqual(autoExitSidecar([{ role: "assistant", stopReason: "stop", content: [] }]), { type: "done" });
+      assert.deepEqual(autoExitSidecar(undefined), { type: "done" });
+    });
+
+    it("an error turn is an error result, not a done result", () => {
+      const messages = [
+        { role: "assistant", stopReason: "stop", content: [text("stale")] },
+        { role: "assistant", stopReason: "error", errorMessage: "overloaded", content: [] },
+      ];
+      assert.deepEqual(autoExitSidecar(messages), { type: "error", errorMessage: "overloaded", stopReason: "error" });
+    });
+
+    it("the parent reads a clean auto-exit as done, with exit code 0", () => {
+      const poll = __pollForExitTest__.interpretExitSidecar(autoExitSidecar([
+        { role: "assistant", stopReason: "stop", content: [text("ok")] },
+      ]));
+      assert.deepEqual(poll, { reason: "done", exitCode: 0, summary: "ok" });
     });
   });
 
